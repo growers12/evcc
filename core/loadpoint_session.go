@@ -98,7 +98,7 @@ func (lp *Loadpoint) stopSession() {
 	}
 
 	s.Finished = lp.clock.Now()
-	s.ChargeDuration = new(lp.chargeDuration.Abs())
+	s.ChargeDuration = new((lp.chargeDuration - lp.chargeDurationOffset).Abs())
 
 	lp.applyEnergyMetrics(s)
 }
@@ -205,6 +205,15 @@ func (lp *Loadpoint) splitSession(v api.Vehicle) {
 	// leg loses or double-counts energy
 	if cr, ok := lp.chargeRater.(wrapper.ChargeResetter); ok {
 		cr.ResetCharge()
+	}
+
+	// the charger's own timer keeps counting from plug-in; compensate in
+	// stopSession instead
+	if ct, ok := lp.chargeTimer.(wrapper.ChargeResetter); ok {
+		ct.ResetCharge()
+		lp.chargeDurationOffset = 0
+	} else {
+		lp.chargeDurationOffset = lp.chargeDuration
 	}
 
 	lp.createSession()

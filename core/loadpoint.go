@@ -175,6 +175,7 @@ type Loadpoint struct {
 	// charge progress
 	vehicleSoc              float64       // Vehicle or charger soc
 	chargeDuration          time.Duration // Charge duration
+	chargeDurationOffset    time.Duration // Charge duration at last session split - charger-provided timers cannot be reset
 	connectedDuration       time.Duration // Connection duration
 	energyMetrics           EnergyMetrics // Stats for charged energy by session
 	chargeRemainingDuration time.Duration // Remaining charge duration
@@ -592,6 +593,9 @@ func (lp *Loadpoint) evVehicleDisconnectHandler() {
 
 	// phases are unknown when vehicle disconnects
 	lp.ResetMeasuredPhases()
+
+	// session splits do not survive a disconnect
+	lp.chargeDurationOffset = 0
 
 	// energy and duration
 	lp.energyMetrics.Publish("session", lp)

@@ -411,3 +411,62 @@ func TestSplitSession(t *testing.T) {
 	assert.Equal(t, 15.0, *s[1].MeterStart)
 	assert.Equal(t, 18.0, *s[1].MeterStop)
 }
+
+func TestSplitSessionChargeDuration(t *testing.T) {
+	var err error
+	serverdb.Instance, err = serverdb.New("sqlite", ":memory:")
+	require.NoError(t, err)
+
+	db, err := session.NewStore("foo", serverdb.Instance)
+	require.NoError(t, err)
+
+	clock := clock.NewMock()
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mm := api.NewMockMeter(ctrl)
+	me := api.NewMockMeterEnergy(ctrl)
+
+	type EnergyDecorator struct {
+		api.Meter
+		api.MeterEnergy
+	}
+
+	cm := &EnergyDecorator{Meter: mm, MeterEnergy: me}
+
+	lp := &Loadpoint{
+		log:         util.NewLogger("foo"),
+		clock:       clock,
+		db:          db,
+		chargeMeter: cm,
+		status:      api.StatusC,
+	}
+
+	me.EXPECT().TotalEnergy().Return(10.0, nil)
+	lp.createSession()
+	lp.updateSession(sessionStart(lp))
+
+	// charger-provided timer counts from plug-in and cannot be reset
+	lp.chargeDuration = 2 * time.Hour
+	lp.energyMetrics.Update(5.0)
+
+	me.EXPECT().TotalEnergy().Return(15.0, nil).Times(2)
+	lp.splitSession(nil)
+
+	assert.Equal(t, 2*time.Hour, lp.chargeDurationOffset)
+
+	// charger timer keeps running: one more hour after the split
+	lp.chargeDuration = 3 * time.Hour
+	lp.energyMetrics.Update(3.0)
+
+	me.EXPECT().TotalEnergy().Return(18.0, nil)
+	lp.stopSession()
+
+	require.NotNil(t, lp.session.ChargeDuration)
+	assert.Equal(t, time.Hour, *lp.session.ChargeDuration, "second leg must only count time since the split")
+
+	// disconnect clears the offset
+	lp.chargeDurationOffset = 0
+	assert.Zero(t, lp.chargeDurationOffset)
+}
