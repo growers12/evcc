@@ -203,3 +203,58 @@ func planStrategyHandler(lp loadpoint.API) http.HandlerFunc {
 		jsonWrite(w, res)
 	}
 }
+
+// sessionSplitter is implemented by loadpoints supporting live session splits.
+// Asserted dynamically instead of extending loadpoint.API, which would force a
+// regeneration of the generated mock in core/loadpoint/mock.go. GetChargedEnergy
+// is included for the same reason: it exists on *Loadpoint (core/loadpoint_api.go)
+// but is not part of the loadpoint.API interface either.
+type sessionSplitter interface {
+	SplitSession(api.Vehicle)
+	GetChargedEnergy() float64
+}
+
+// sessionSplitHandler ends the running session and starts a new one, optionally
+// assigning a different vehicle
+func sessionSplitHandler(site site.API, lp loadpoint.API) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		splitter, ok := lp.(sessionSplitter)
+		if !ok {
+			jsonError(w, http.StatusNotImplemented, errors.New("session split not supported"))
+			return
+		}
+
+		// preconditions are checked through lock-protected api methods so we
+		// never touch lp.session from this goroutine
+		if lp.GetStatus() == api.StatusA {
+			jsonError(w, http.StatusConflict, errors.New("no vehicle connected"))
+			return
+		}
+
+		if splitter.GetChargedEnergy() == 0 {
+			jsonError(w, http.StatusConflict, errors.New("session has no energy"))
+			return
+		}
+
+		var v api.Vehicle
+		if name, ok := mux.Vars(r)["name"]; ok && name != "" {
+			vv, err := site.Vehicles().ByName(name)
+			if err != nil {
+				jsonError(w, http.StatusBadRequest, err)
+				return
+			}
+			v = vv.Instance()
+		}
+
+		splitter.SplitSession(v)
+
+		res := struct {
+			Vehicle string `json:"vehicle"`
+		}{}
+		if v != nil {
+			res.Vehicle = v.GetTitle()
+		}
+
+		jsonWrite(w, res)
+	}
+}
