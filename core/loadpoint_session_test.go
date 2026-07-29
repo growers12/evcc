@@ -7,6 +7,7 @@ import (
 	"github.com/benbjohnson/clock"
 	"github.com/evcc-io/evcc/api"
 	"github.com/evcc-io/evcc/core/session"
+	"github.com/evcc-io/evcc/core/wrapper"
 	serverdb "github.com/evcc-io/evcc/server/db"
 	"github.com/evcc-io/evcc/util"
 	"github.com/stretchr/testify/assert"
@@ -466,7 +467,65 @@ func TestSplitSessionChargeDuration(t *testing.T) {
 	require.NotNil(t, lp.session.ChargeDuration)
 	assert.Equal(t, time.Hour, *lp.session.ChargeDuration, "second leg must only count time since the split")
 
-	// disconnect clears the offset
-	lp.chargeDurationOffset = 0
-	assert.Zero(t, lp.chargeDurationOffset)
+	// disconnect clears the offset - evVehicleDisconnectHandler re-finalizes
+	// session energy on the way, so it needs a chargeRater. Report the same
+	// (already-persisted) charged energy so finalizeSessionEnergy is a no-op
+	// and doesn't require additional meter reads.
+	rater := api.NewMockChargeRater(ctrl)
+	rater.EXPECT().ChargedEnergy().Return(lp.session.ChargedEnergy, nil)
+	lp.chargeRater = rater
+
+	lp.evVehicleDisconnectHandler()
+	assert.Zero(t, lp.chargeDurationOffset, "disconnect must clear a stale split offset")
+}
+
+// TestSplitSessionResettableChargeTimer covers the branch of splitSession where
+// lp.chargeTimer does implement wrapper.ChargeResetter (e.g. wrapper.ChargeTimer,
+// used for chargers without their own api.ChargeTimer): the timer itself gets
+// reset and no offset is needed. TestSplitSessionChargeDuration only exercises
+// the opposite branch (lp.chargeTimer is nil, so not a ChargeResetter).
+func TestSplitSessionResettableChargeTimer(t *testing.T) {
+	var err error
+	serverdb.Instance, err = serverdb.New("sqlite", ":memory:")
+	require.NoError(t, err)
+
+	db, err := session.NewStore("foo", serverdb.Instance)
+	require.NoError(t, err)
+
+	clock := clock.NewMock()
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mm := api.NewMockMeter(ctrl)
+	me := api.NewMockMeterEnergy(ctrl)
+
+	type EnergyDecorator struct {
+		api.Meter
+		api.MeterEnergy
+	}
+
+	cm := &EnergyDecorator{Meter: mm, MeterEnergy: me}
+
+	lp := &Loadpoint{
+		log:         util.NewLogger("foo"),
+		clock:       clock,
+		db:          db,
+		chargeMeter: cm,
+		chargeTimer: wrapper.NewChargeTimer(),
+		status:      api.StatusC,
+	}
+
+	me.EXPECT().TotalEnergy().Return(10.0, nil)
+	lp.createSession()
+	lp.updateSession(sessionStart(lp))
+
+	// simulate a stale offset from an earlier split to prove the ResetCharge
+	// branch actually runs, rather than just reading back a zero default
+	lp.chargeDurationOffset = 99 * time.Hour
+
+	me.EXPECT().TotalEnergy().Return(15.0, nil).Times(2)
+	lp.splitSession(nil)
+
+	assert.Zero(t, lp.chargeDurationOffset, "resettable charge timer must not need a duration offset")
 }
