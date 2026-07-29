@@ -2011,6 +2011,18 @@ func (lp *Loadpoint) addTask(task func()) {
 	}
 }
 
+// enqueueTask adds a task to the queue without addTask's deduplication.
+// addTask compares reflect.Value.Pointer(), which for a closure yields the code
+// pointer of the enclosing function literal - every closure created from the
+// same literal therefore compares equal, no matter which values it captured.
+// Tasks whose effect depends on captured state must use this instead.
+func (lp *Loadpoint) enqueueTask(task func()) {
+	// test guard
+	if lp.tasks != nil {
+		lp.tasks.Enqueue(task)
+	}
+}
+
 // processTasks executes a single task from the queue
 func (lp *Loadpoint) processTasks() {
 	// test guard

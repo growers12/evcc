@@ -210,12 +210,38 @@ func planStrategyHandler(lp loadpoint.API) http.HandlerFunc {
 // is included for the same reason: it exists on *Loadpoint (core/loadpoint_api.go)
 // but is not part of the loadpoint.API interface either.
 type sessionSplitter interface {
-	SplitSession(api.Vehicle)
+	SplitSession(api.Vehicle, bool)
 	GetChargedEnergy() float64
 }
 
+// sessionSplitVehicleNone is the reserved {name} path segment that splits the
+// session and detaches the vehicle (guest car). It only takes effect when no
+// vehicle of that name exists, so a real vehicle named "none" still wins.
+const sessionSplitVehicleNone = "none"
+
+// resolveSplitVehicle resolves the optional {name} path segment of a session
+// split into either a vehicle to assign, or the request to detach the vehicle.
+// The registry is asked first so a real vehicle can never be shadowed by the
+// reserved name.
+func resolveSplitVehicle(vehicles site.Vehicles, name string) (api.Vehicle, bool, error) {
+	if name == "" {
+		return nil, false, nil
+	}
+
+	vv, err := vehicles.ByName(name)
+	if err == nil {
+		return vv.Instance(), false, nil
+	}
+
+	if name == sessionSplitVehicleNone {
+		return nil, true, nil
+	}
+
+	return nil, false, err
+}
+
 // sessionSplitHandler ends the running session and starts a new one, optionally
-// assigning a different vehicle
+// assigning a different vehicle or detaching the current one
 func sessionSplitHandler(site site.API, lp loadpoint.API) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		splitter, ok := lp.(sessionSplitter)
@@ -236,21 +262,20 @@ func sessionSplitHandler(site site.API, lp loadpoint.API) http.HandlerFunc {
 			return
 		}
 
-		var v api.Vehicle
-		if name, ok := mux.Vars(r)["name"]; ok && name != "" {
-			vv, err := site.Vehicles().ByName(name)
-			if err != nil {
-				jsonError(w, http.StatusBadRequest, err)
-				return
-			}
-			v = vv.Instance()
+		v, detach, err := resolveSplitVehicle(site.Vehicles(), mux.Vars(r)["name"])
+		if err != nil {
+			jsonError(w, http.StatusBadRequest, err)
+			return
 		}
 
-		splitter.SplitSession(v)
+		splitter.SplitSession(v, detach)
 
 		res := struct {
 			Vehicle string `json:"vehicle"`
-		}{}
+			Detach  bool   `json:"detach,omitempty"`
+		}{
+			Detach: detach,
+		}
 		if v != nil {
 			res.Vehicle = v.GetTitle()
 		}
