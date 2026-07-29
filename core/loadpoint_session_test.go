@@ -343,3 +343,71 @@ func TestFinalizeSessionEnergy(t *testing.T) {
 		assert.NotPanics(t, func() { lp.finalizeSessionEnergy() })
 	})
 }
+
+func TestSplitSession(t *testing.T) {
+	var err error
+	serverdb.Instance, err = serverdb.New("sqlite", ":memory:")
+	require.NoError(t, err)
+
+	db, err := session.NewStore("foo", serverdb.Instance)
+	require.NoError(t, err)
+
+	clock := clock.NewMock()
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mm := api.NewMockMeter(ctrl)
+	me := api.NewMockMeterEnergy(ctrl)
+
+	type EnergyDecorator struct {
+		api.Meter
+		api.MeterEnergy
+	}
+
+	cm := &EnergyDecorator{Meter: mm, MeterEnergy: me}
+
+	lp := &Loadpoint{
+		log:         util.NewLogger("foo"),
+		clock:       clock,
+		db:          db,
+		chargeMeter: cm,
+		status:      api.StatusC,
+	}
+
+	// first session starts at meter 10.0 kWh
+	me.EXPECT().TotalEnergy().Return(10.0, nil)
+	lp.createSession()
+	lp.updateSession(sessionStart(lp))
+
+	// charge 5 kWh
+	clock.Add(time.Hour)
+	lp.energyMetrics.Update(5.0)
+
+	// split at meter 15.0 - stopSession and createSession read the meter once each
+	me.EXPECT().TotalEnergy().Return(15.0, nil).Times(2)
+	lp.splitSession(nil)
+
+	require.NotNil(t, lp.session)
+	assert.False(t, lp.session.Created.IsZero(), "new session must be marked started while charging")
+	assert.Zero(t, lp.getChargedEnergy(), "energy counter must restart at zero")
+
+	// charge another 3 kWh on the new session
+	clock.Add(time.Hour)
+	lp.energyMetrics.Update(3.0)
+
+	me.EXPECT().TotalEnergy().Return(18.0, nil)
+	lp.stopSession()
+
+	s, err := db.Sessions()
+	require.NoError(t, err)
+	require.Len(t, s, 2)
+
+	assert.Equal(t, 5.0, s[0].ChargedEnergy)
+	assert.Equal(t, 10.0, *s[0].MeterStart)
+	assert.Equal(t, 15.0, *s[0].MeterStop)
+
+	assert.Equal(t, 3.0, s[1].ChargedEnergy)
+	assert.Equal(t, 15.0, *s[1].MeterStart)
+	assert.Equal(t, 18.0, *s[1].MeterStop)
+}

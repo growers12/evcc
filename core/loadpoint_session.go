@@ -176,3 +176,53 @@ func (lp *Loadpoint) resetHeatingSession() {
 
 	lp.createSession()
 }
+
+// SplitSession ends the running charging session and starts a new one without
+// requiring the vehicle to be disconnected. The split is queued as a task so it
+// runs in the loadpoint's goroutine - lp.session, lp.energyMetrics and
+// lp.chargeRater are not lock-protected and must not be touched from the api
+// handler's goroutine.
+func (lp *Loadpoint) SplitSession(v api.Vehicle) {
+	lp.addTask(func() {
+		lp.splitSession(v)
+	})
+	lp.requestUpdate()
+}
+
+// splitSession finishes the current session and starts a new one, optionally
+// assigning a different vehicle. Must run in the loadpoint's goroutine.
+func (lp *Loadpoint) splitSession(v api.Vehicle) {
+	if lp.db == nil || lp.session == nil {
+		return
+	}
+
+	charging := lp.charging()
+
+	lp.stopSession()
+	lp.clearSession()
+
+	// rebase the energy counter onto the current meter reading so that neither
+	// leg loses or double-counts energy
+	if cr, ok := lp.chargeRater.(wrapper.ChargeResetter); ok {
+		cr.ResetCharge()
+	}
+
+	lp.createSession()
+
+	if v != nil {
+		lp.setActiveVehicle(v)
+	}
+
+	// while the charger stays in status C no evChargeStart fires, so Created
+	// would remain zero and stopSession would drop the second leg silently
+	if charging {
+		lp.updateSession(func(s *session.Session) {
+			s.Created = lp.clock.Now()
+			if soc := lp.vehicleSoc; soc > 0 && !lp.chargerHasFeature(api.Heating) {
+				s.SocStart = &soc
+			}
+		})
+	}
+
+	lp.log.INFO.Printf("session split, vehicle: %s", lp.session.Vehicle)
+}
