@@ -332,6 +332,7 @@ func (lp *Loadpoint) vehicleOdometer() {
 		if odo, err := vs.Odometer(); err == nil {
 			lp.log.DEBUG.Printf("vehicle odometer: %.0fkm", odo)
 			lp.publish(keys.VehicleOdometer, odo)
+			lp.socEstimateOdometer = odo
 
 			// update session once odometer is read
 			lp.updateSession(func(session *session.Session) {

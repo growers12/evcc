@@ -18,6 +18,17 @@ const (
 
 	// socEstimateMaxOffset caps a restored offset, in percentage points
 	socEstimateMaxOffset = 50.0
+
+	// socLearnMinRise is the smallest soc rise worth learning from, in points
+	socLearnMinRise = 10.0
+
+	// socLearnMaxDistance caps the driving between unplug and the first fresh
+	// reading, in km. The car only regains network after leaving the garage,
+	// so some driving is unavoidable — but not an arbitrary amount.
+	socLearnMaxDistance = 20.0
+
+	// socLearnSmoothing weights a new measurement against the running value
+	socLearnSmoothing = 0.3
 )
 
 // SocEstimate is the persisted state of a vehicle's soc estimation.
@@ -67,6 +78,43 @@ func (se SocEstimate) plausible(now time.Time) bool {
 	default:
 		return true
 	}
+}
+
+// learn folds a fresh vehicle reading into the gradient and re-anchors the
+// record. The bool reports whether the gradient was actually updated.
+//
+// The anchor is re-set even when learning is rejected. Otherwise a single
+// missed learning moment — a long drive before the car reports — would leave
+// EnergySinceAnchor growing against a stale anchor forever.
+func (se SocEstimate) learn(newSoc, odometer, capacity float64) (SocEstimate, bool) {
+	rise := newSoc - se.AnchorSoc
+	distance := odometer - se.OdometerAtAnchor
+	nominal := capacity * 1e3 / soc.ChargeEfficiency / 100
+
+	learned := false
+
+	switch {
+	case rise < socLearnMinRise:
+	case se.EnergySinceAnchor <= 0:
+	case odometer > 0 && se.OdometerAtAnchor > 0 && distance > socLearnMaxDistance:
+	default:
+		// energySinceAnchor is measured at the charger, so the learned value
+		// carries the real charging losses — which is exactly what the 85%
+		// efficiency factor stands in for until then
+		measured := se.EnergySinceAnchor / rise
+
+		if measured >= 0.5*nominal && measured <= 2*nominal {
+			se.EnergyPerSocStep = (1-socLearnSmoothing)*se.EnergyPerSocStep + socLearnSmoothing*measured
+			se.Samples++
+			learned = true
+		}
+	}
+
+	se.AnchorSoc = newSoc
+	se.EnergySinceAnchor = 0
+	se.OdometerAtAnchor = odometer
+
+	return se, learned
 }
 
 func socEstimateSettingsKey(name string) string {
@@ -120,16 +168,27 @@ func (lp *Loadpoint) updateSocEstimate(estimator *soc.Estimator) {
 	se, _ := loadSocEstimate(vehicleName)
 
 	// the estimator rebases prevSoc whenever the source reports a changed
-	// value; that is the moment the blind phase ends
+	// value; that is the moment the blind phase ends and learning is possible
+	learnedThisCall := false
 	if se.AnchorSoc != st.PrevSoc {
-		se.AnchorSoc = st.PrevSoc
-		se.EnergySinceAnchor = 0
-		se.OdometerAtAnchor = lp.socEstimateOdometer
+		se, learnedThisCall = se.learn(st.PrevSoc, lp.socEstimateOdometer, lp.vehicleCapacity())
+
+		if learnedThisCall {
+			lp.log.INFO.Printf("soc gradient learned: %.1f Wh/%% (%d samples)", se.EnergyPerSocStep, se.Samples)
+		}
 	}
 
 	// energy the estimator currently attributes to this anchor
 	se.EnergySinceAnchor = (st.VehicleSoc - st.PrevSoc) * st.EnergyPerSocStep
-	se.EnergyPerSocStep = st.EnergyPerSocStep
+
+	// outside a learning call, mirror the live estimator's own gradient (e.g.
+	// its upstream in-session learner, see soc.Estimator.Soc). A gradient just
+	// learned above must survive this line rather than be overwritten by the
+	// stale value the estimator still holds — it only sees the fresh reading
+	// on its *next* poll.
+	if !learnedThisCall {
+		se.EnergyPerSocStep = st.EnergyPerSocStep
+	}
 	se.Updated = lp.clock.Now()
 
 	if err := saveSocEstimate(vehicleName, se); err != nil {
@@ -162,4 +221,12 @@ func (lp *Loadpoint) restoreSocEstimate() {
 	lp.socEstimator.Restore(se.AnchorSoc, se.EnergySinceAnchor, se.EnergyPerSocStep, lp.GetChargedEnergy(), se.Samples > 0)
 
 	lp.log.INFO.Printf("soc estimate restored: %.1f%% (anchor %.1f%%, %.0f Wh since)", se.soc(), se.AnchorSoc, se.EnergySinceAnchor)
+}
+
+// vehicleCapacity returns the active vehicle's nominal capacity in kWh
+func (lp *Loadpoint) vehicleCapacity() float64 {
+	if v := lp.GetVehicle(); v != nil {
+		return v.Capacity()
+	}
+	return 0
 }

@@ -153,6 +153,114 @@ func TestRestoreDropsOffsetWhenSourceMovedOn(t *testing.T) {
 	assert.Equal(t, 42.0, lp.socEstimator.Soc(&fresh, 0), "stale offset must not survive a moved source")
 }
 
+func TestLearnGradient(t *testing.T) {
+	// 8.5 kWh nominal => 100 Wh/% initial, 10000 Wh virtual capacity
+	const capacity = 8.5
+
+	tc := []struct {
+		name     string
+		se       SocEstimate
+		newSoc   float64
+		odometer float64
+		learned  bool
+		expected float64
+	}{
+		{
+			"clean 40 point rise",
+			SocEstimate{AnchorSoc: 15, EnergySinceAnchor: 4800, EnergyPerSocStep: 100, OdometerAtAnchor: 28011},
+			55, 28013, true,
+			// measured 4800/40 = 120, EMA 0.7*100 + 0.3*120 = 106
+			106,
+		},
+		{
+			"rise too small",
+			SocEstimate{AnchorSoc: 15, EnergySinceAnchor: 800, EnergyPerSocStep: 100, OdometerAtAnchor: 28011},
+			23, 28013, false, 100,
+		},
+		{
+			"no energy since anchor",
+			SocEstimate{AnchorSoc: 15, EnergySinceAnchor: 0, EnergyPerSocStep: 100, OdometerAtAnchor: 28011},
+			55, 28013, false, 100,
+		},
+		{
+			"drove too far before reporting",
+			SocEstimate{AnchorSoc: 15, EnergySinceAnchor: 4800, EnergyPerSocStep: 100, OdometerAtAnchor: 28011},
+			55, 28040, false, 100,
+		},
+		{
+			"result beyond twice nominal",
+			SocEstimate{AnchorSoc: 15, EnergySinceAnchor: 40000, EnergyPerSocStep: 100, OdometerAtAnchor: 28011},
+			55, 28013, false, 100,
+		},
+		{
+			"soc dropped",
+			SocEstimate{AnchorSoc: 55, EnergySinceAnchor: 4800, EnergyPerSocStep: 100, OdometerAtAnchor: 28011},
+			15, 28013, false, 100,
+		},
+	}
+
+	for _, tc := range tc {
+		t.Run(tc.name, func(t *testing.T) {
+			got, learned := tc.se.learn(tc.newSoc, tc.odometer, capacity)
+
+			assert.Equal(t, tc.learned, learned)
+			assert.InDelta(t, tc.expected, got.EnergyPerSocStep, 0.01)
+
+			// the anchor is re-set either way, or a missed learning moment
+			// would block the record forever
+			assert.Equal(t, tc.newSoc, got.AnchorSoc)
+			assert.Equal(t, 0.0, got.EnergySinceAnchor)
+			assert.Equal(t, tc.odometer, got.OdometerAtAnchor)
+		})
+	}
+}
+
+func TestLearnCountsSamples(t *testing.T) {
+	se := SocEstimate{AnchorSoc: 15, EnergySinceAnchor: 4800, EnergyPerSocStep: 100, OdometerAtAnchor: 28011, Samples: 2}
+
+	got, learned := se.learn(55, 28013, 8.5)
+	assert.True(t, learned)
+	assert.Equal(t, 3, got.Samples)
+}
+
+// TestUpdateSocEstimateLearnsAcrossSessionBoundary exercises learn() through
+// updateSocEstimate end to end, guarding against the bookkeeping block below
+// the rebase silently overwriting a gradient that was just learned.
+func TestUpdateSocEstimateLearnsAcrossSessionBoundary(t *testing.T) {
+	lp := NewLoadpoint(util.NewLogger("test"), coresettings.NewDatabaseSettingsAdapter("test."))
+
+	ctrl := gomock.NewController(t)
+	vehicle := api.NewMockVehicle(ctrl)
+	vehicle.EXPECT().Capacity().Return(8.5).AnyTimes()
+	lp.vehicle = vehicle // vehicleCapacity() reads the active vehicle via GetVehicle()
+	lp.socEstimateVehicle = "test:6"
+	lp.socEstimateOdometer = 28011
+
+	// session 1: anchor at 15%, source frozen, 4800 Wh delivered
+	lp.socEstimator = soc.NewEstimator(lp.log, api.NewMockCharger(ctrl), vehicle)
+	source := 15.0
+	lp.socEstimator.Soc(&source, 0)
+	lp.updateSocEstimate(lp.socEstimator)
+	lp.socEstimator.Soc(&source, 4800)
+	lp.updateSocEstimate(lp.socEstimator)
+
+	// unplug, drive 2km (within the guard), replug: fresh estimator restores the anchor
+	lp.socEstimateOdometer = 28013
+	lp.socEstimator = soc.NewEstimator(lp.log, api.NewMockCharger(ctrl), vehicle)
+	lp.restoreSocEstimate()
+
+	// the car finally reports the real value: a clean 40 point rise
+	source = 55.0
+	lp.socEstimator.Soc(&source, 0)
+	lp.updateSocEstimate(lp.socEstimator)
+
+	se, ok := loadSocEstimate("test:6")
+	require.True(t, ok)
+	// measured 4800/40 = 120, EMA 0.7*100 + 0.3*120 = 106
+	assert.InDelta(t, 106.0, se.EnergyPerSocStep, 0.01, "learned gradient must survive the persisted record")
+	assert.Equal(t, 1, se.Samples)
+}
+
 func TestRestoreSocEstimateDropsExpiredOffset(t *testing.T) {
 	lp := NewLoadpoint(util.NewLogger("test"), coresettings.NewDatabaseSettingsAdapter("test."))
 
