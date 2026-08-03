@@ -113,31 +113,90 @@ Known limitation: after a vehicle swap the new session's `soc_start` stays empty
 
 ## Using this
 
-The branch `master` is the 0.313.1 tag plus the above. It deliberately does **not** track upstream
-master — pinning to a tested release is the point, so GitHub will show this fork as "behind".
+The branch `master` is the **0.313.1** tag plus the above. It deliberately does **not** track upstream
+master — pinning to a tested release is the point, so GitHub will show this fork as "behind". That is
+not a maintenance backlog.
 
-Build it like upstream evcc (`make` after `make install-ui && make install`), or clone this branch in
+Build it like upstream evcc (`make install-ui && make install`, then `make`), or clone this branch in
 your own Docker build.
 
-On a version bump, rebase `master` onto the new tag. Two things `git apply` cannot catch and that a
-rebase can quietly reopen:
+---
 
-- **`restoreSocEstimate` has to run *after* `energyMetrics.Reset()`.** `evVehicleConnectHandler` calls
-  `vehicleDefaultOrDetect()` — and with it `setActiveVehicle` — before `createSession()`, and
-  `createSession()` is what zeroes the session counter the anchor is measured against. Anchoring
-  before that reset looks correct at process start (the counter really is zero there) but collapses
-  the estimate onto the stale reading on every *subsequent* plug-in, and overwrites the stored record
-  with zero. The restore therefore lives at the end of `createSession()`.
-- **`SetSoc` must not move `prevSoc`, `Restore` must set it.** These sound contradictory and are not:
-  `SetSoc` works on an already-anchored estimator, `Restore` on a fresh one whose `prevSoc` is 0 and
-  whose first poll would otherwise take the rebase branch and discard everything restored.
+## Rebasing onto a newer upstream release
 
-There is deliberately **no odometer guard** on the learner. It was tried and removed: a vehicle that
-writes its odometer at ignition-off — in the garage, without reception — reports a distance that
-describes the drive *before* the anchor, which cannot corrupt the measurement. The guard rejected
-every real learning opportunity while protecting against nothing.
+### 1. Is there anything to move to?
 
-Unit tests for both features live in the branch; `go test ./core/... ./server/`.
+```bash
+gh api repos/evcc-io/evcc/releases/latest --jq .tag_name
+```
+
+Compare against the tag named above. Only *released* tags — upstream master carries unreleased work
+and moves constantly; rebasing onto it means re-doing this every few days and inheriting bugs before
+upstream has found them.
+
+### 2. Rebase
+
+```bash
+OLD=0.313.1      # the tag this branch is currently based on
+NEW=0.314.0      # the new release
+
+git fetch --depth=1 origin tag $NEW      # --depth only matters on a shallow clone
+git rebase --onto $NEW $OLD master
+```
+
+Give the old base **explicitly**. On a shallow clone git finds no merge base and a plain
+`git rebase $NEW` will do the wrong thing or refuse.
+
+### 3. The conflict surface
+
+The fork adds four files that cannot conflict, and touches nine existing ones that can:
+
+| File | What we add |
+|---|---|
+| `server/http.go` | route map entries — **the most likely conflict**, upstream adds routes here regularly |
+| `core/loadpoint.go` | struct fields, one call in `publishSocAndRange` |
+| `core/loadpoint_session.go` | `SplitSession`/`splitSession`, the restore call in `createSession` |
+| `core/loadpoint_vehicle.go` | vehicle name bookkeeping in `setActiveVehicle` |
+| `core/site_vehicles.go` | one field in the published vehicle struct |
+| `core/soc/estimator.go` | two fields and their assignments |
+| `server/http_loadpoint_handler.go` | the session-split handler |
+| plus three `_test.go` files | |
+
+### 4. What `git rebase` cannot catch
+
+Three things survive a clean rebase and then misbehave at runtime. Check them by hand, every time.
+
+**`restoreSocEstimate` must still run *after* `energyMetrics.Reset()`.** `evVehicleConnectHandler`
+calls `vehicleDefaultOrDetect()` — and with it `setActiveVehicle` — before `createSession()`, and
+`createSession()` is what zeroes the session counter the anchor is measured against. Anchoring before
+that reset looks correct at process start (the counter really is zero there) but collapses the
+estimate onto the stale reading on **every subsequent plug-in**, and overwrites the stored record
+with zero. If upstream reorders that handler, this breaks silently. Symptom: a correct estimate that
+resets on each connect. **A plain restart test does not catch it.**
+
+**`SetSoc` must not move `prevSoc`, `Restore` must set it.** These sound contradictory and are not:
+`SetSoc` works on an already-anchored estimator, `Restore` on a fresh one whose `prevSoc` is 0 and
+whose first poll would otherwise take the rebase branch and discard everything restored.
+
+**The session split's lossless energy rebase depends on `lp.chargeRater` being evcc's own
+`wrapper.ChargeRater`.** That holds only while your charger does *not* implement `api.ChargeRater`.
+If a driver gains it upstream, `ResetCharge()` becomes a no-op and **every split counts the first
+leg's energy again in the second** — silently, with plausible numbers. The code logs a WARN when the
+type assertion fails; grep for that driver's energy register after every bump.
+
+### 5. Test and publish
+
+```bash
+go test ./core/... ./server/
+git rebase --continue   # if needed
+git push --force
+```
+
+Both features carry their own unit tests, including a regression test that drives the connect path in
+production order (`energyMetrics` → connect → restore → `Reset()` → poll) precisely because the
+ordering trap above passes a naive test.
+
+Finally, record the new base tag at the top of this file.
 
 ---
 
