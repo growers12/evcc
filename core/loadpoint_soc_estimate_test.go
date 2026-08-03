@@ -318,12 +318,7 @@ func TestSetSocEstimateOutOfRange(t *testing.T) {
 // TestSetSocEstimateQueuesTask and TestShiftSocEstimateQueuesTask mirror
 // TestSplitSessionQueuesEverySplit: they check that both methods use
 // enqueueTask rather than addTask, i.e. that a second call is not silently
-// dropped because it shares the same closure's code pointer. The tasks are
-// deliberately left unrun - running them would exercise updateSocEstimate,
-// which persists via saveSocEstimate/settings.SetJson and only touches the
-// in-memory settings slice, so that part would be safe; but there is no
-// reason to actually execute the closures here, only to prove they were
-// enqueued.
+// dropped because it shares the same closure's code pointer.
 func TestSetSocEstimateQueuesTask(t *testing.T) {
 	lp := NewLoadpoint(util.NewLogger("test"), coresettings.NewDatabaseSettingsAdapter("test."))
 
@@ -350,6 +345,59 @@ func TestShiftSocEstimateQueuesTask(t *testing.T) {
 	require.NoError(t, lp.ShiftSocEstimate(-2.0))
 
 	assert.Equal(t, 2, lp.tasks.Size(), "second call must not be deduplicated away")
+}
+
+// TestSetSocEstimateAppliesTarget runs the queued task, unlike the
+// QueuesTask tests above - this is safe here because the task's only side
+// effect is updateSocEstimate -> saveSocEstimate -> settings.SetJson, which
+// only touches the in-memory settings slice (see the ClearSocEstimate tests
+// for the case where running the task is NOT safe).
+func TestSetSocEstimateAppliesTarget(t *testing.T) {
+	lp := NewLoadpoint(util.NewLogger("test"), coresettings.NewDatabaseSettingsAdapter("test."))
+	lp.socEstimateVehicle = "test:setapply"
+
+	ctrl := gomock.NewController(t)
+	vehicle := api.NewMockVehicle(ctrl)
+	vehicle.EXPECT().Capacity().Return(8.5).AnyTimes()
+	lp.socEstimator = soc.NewEstimator(lp.log, api.NewMockCharger(ctrl), vehicle)
+
+	require.NoError(t, lp.SetSocEstimate(42))
+
+	task, ok := lp.tasks.Dequeue()
+	require.True(t, ok)
+	task()
+
+	assert.InDelta(t, 42.0, lp.socEstimator.State().VehicleSoc, 0.01)
+
+	se, ok := loadSocEstimate("test:setapply")
+	require.True(t, ok)
+	assert.InDelta(t, 42.0, se.soc(), 0.01, "the persisted record must follow the override")
+}
+
+// TestShiftSocEstimateAppliesShift is the ShiftSocEstimate counterpart of
+// TestSetSocEstimateAppliesTarget, and additionally covers the kwh -> Wh
+// conversion at the api boundary: soc.Estimator.ShiftEnergy takes Wh, but
+// ShiftSocEstimate's parameter is documented as kWh.
+func TestShiftSocEstimateAppliesShift(t *testing.T) {
+	lp := NewLoadpoint(util.NewLogger("test"), coresettings.NewDatabaseSettingsAdapter("test."))
+	lp.socEstimateVehicle = "test:shiftapply"
+
+	ctrl := gomock.NewController(t)
+	vehicle := api.NewMockVehicle(ctrl)
+	vehicle.EXPECT().Capacity().Return(8.5).AnyTimes()
+	lp.socEstimator = soc.NewEstimator(lp.log, api.NewMockCharger(ctrl), vehicle)
+
+	before := lp.socEstimator.State().VehicleSoc
+
+	// energyPerSocStep is 100 Wh/% for an 8.5 kWh vehicle (see NewEstimator);
+	// 1 kWh should therefore raise the estimate by 10 points
+	require.NoError(t, lp.ShiftSocEstimate(1.0))
+
+	task, ok := lp.tasks.Dequeue()
+	require.True(t, ok)
+	task()
+
+	assert.InDelta(t, before+10, lp.socEstimator.State().VehicleSoc, 0.01, "ShiftSocEstimate must convert kWh to Wh before calling ShiftEnergy")
 }
 
 // TestClearSocEstimateWithoutVehicle covers the synchronous guard in
