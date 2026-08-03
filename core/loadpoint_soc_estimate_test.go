@@ -4,8 +4,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/evcc-io/evcc/api"
+	coresettings "github.com/evcc-io/evcc/core/settings"
+	"github.com/evcc-io/evcc/core/soc"
+	"github.com/evcc-io/evcc/util"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
 )
 
 func TestSocEstimateSoc(t *testing.T) {
@@ -70,4 +75,80 @@ func TestSocEstimateRoundtrip(t *testing.T) {
 
 	_, ok = loadSocEstimate("test:does-not-exist")
 	assert.False(t, ok)
+}
+
+func TestUpdateSocEstimateTracksAnchor(t *testing.T) {
+	lp := NewLoadpoint(util.NewLogger("test"), coresettings.NewDatabaseSettingsAdapter("test."))
+
+	ctrl := gomock.NewController(t)
+	vehicle := api.NewMockVehicle(ctrl)
+	vehicle.EXPECT().Capacity().Return(8.5).AnyTimes()
+	lp.socEstimator = soc.NewEstimator(lp.log, api.NewMockCharger(ctrl), vehicle)
+	lp.socEstimateVehicle = "test:2"
+
+	source := 15.0
+	lp.socEstimator.Soc(&source, 0)
+	lp.updateSocEstimate()
+
+	se, ok := loadSocEstimate("test:2")
+	require.True(t, ok)
+	assert.Equal(t, 15.0, se.AnchorSoc)
+	assert.Equal(t, 0.0, se.EnergySinceAnchor)
+
+	// 300 Wh into the session, source still frozen
+	lp.socEstimator.Soc(&source, 300)
+	lp.updateSocEstimate()
+
+	se, _ = loadSocEstimate("test:2")
+	assert.Equal(t, 15.0, se.AnchorSoc, "anchor stays put while the source is frozen")
+	assert.Equal(t, 300.0, se.EnergySinceAnchor)
+}
+
+func TestUpdateSocEstimateAccumulatesAcrossSessions(t *testing.T) {
+	lp := NewLoadpoint(util.NewLogger("test"), coresettings.NewDatabaseSettingsAdapter("test."))
+
+	ctrl := gomock.NewController(t)
+	vehicle := api.NewMockVehicle(ctrl)
+	vehicle.EXPECT().Capacity().Return(8.5).AnyTimes()
+	lp.socEstimateVehicle = "test:3"
+
+	// first session delivers 300 Wh
+	lp.socEstimator = soc.NewEstimator(lp.log, api.NewMockCharger(ctrl), vehicle)
+	source := 15.0
+	lp.socEstimator.Soc(&source, 0)
+	lp.socEstimator.Soc(&source, 300)
+	lp.updateSocEstimate()
+
+	// unplug and replug: fresh estimator, session counter back to zero
+	lp.socEstimator = soc.NewEstimator(lp.log, api.NewMockCharger(ctrl), vehicle)
+	lp.restoreSocEstimate()
+	lp.socEstimator.Soc(&source, 0)
+	lp.socEstimator.Soc(&source, 200)
+	lp.updateSocEstimate()
+
+	se, _ := loadSocEstimate("test:3")
+	assert.Equal(t, 500.0, se.EnergySinceAnchor, "energy accumulates across the session boundary")
+}
+
+func TestRestoreDropsOffsetWhenSourceMovedOn(t *testing.T) {
+	lp := NewLoadpoint(util.NewLogger("test"), coresettings.NewDatabaseSettingsAdapter("test."))
+
+	ctrl := gomock.NewController(t)
+	vehicle := api.NewMockVehicle(ctrl)
+	vehicle.EXPECT().Capacity().Return(8.5).AnyTimes()
+	lp.socEstimateVehicle = "test:4"
+
+	require.NoError(t, saveSocEstimate("test:4", SocEstimate{
+		AnchorSoc: 15, EnergySinceAnchor: 500, EnergyPerSocStep: 100, Updated: time.Now(),
+	}))
+
+	lp.socEstimator = soc.NewEstimator(lp.log, api.NewMockCharger(ctrl), vehicle)
+	lp.restoreSocEstimate()
+	assert.Equal(t, 20.0, lp.socEstimator.State().VehicleSoc)
+
+	// the car was driven while evcc was down and now reports a real value.
+	// restoreSocEstimate does not check this — the estimator's rebase branch
+	// does, because Restore anchored prevSoc at 15.
+	fresh := 42.0
+	assert.Equal(t, 42.0, lp.socEstimator.Soc(&fresh, 0), "stale offset must not survive a moved source")
 }

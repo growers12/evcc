@@ -91,3 +91,76 @@ func saveSocEstimate(name string, se SocEstimate) error {
 func deleteSocEstimate(name string) error {
 	return settings.Delete(socEstimateSettingsKey(name))
 }
+
+// updateSocEstimate mirrors the running estimator into the persisted record.
+//
+// The estimator's own prevChargedEnergy is relative to the session counter and
+// therefore useless across an unplug. energySinceAnchor is accumulated here
+// instead: the session's contribution is folded into a persisted base, so the
+// figure survives unplugging, session splits and restarts.
+func (lp *Loadpoint) updateSocEstimate() {
+	if lp.socEstimator == nil || lp.socEstimateVehicle == "" {
+		return
+	}
+
+	st := lp.socEstimator.State()
+	if st.EnergyPerSocStep <= 0 {
+		return
+	}
+
+	se, _ := loadSocEstimate(lp.socEstimateVehicle)
+
+	// the estimator rebases prevSoc whenever the source reports a changed
+	// value; that is the moment the blind phase ends
+	if se.AnchorSoc != st.PrevSoc {
+		se.AnchorSoc = st.PrevSoc
+		se.EnergySinceAnchor = 0
+		se.OdometerAtAnchor = lp.socEstimateOdometer
+		lp.socEstimateBase = 0
+	}
+
+	// energy the estimator currently attributes to this anchor
+	se.EnergySinceAnchor = lp.socEstimateBase + (st.VehicleSoc-st.PrevSoc)*st.EnergyPerSocStep
+	se.EnergyPerSocStep = st.EnergyPerSocStep
+	se.Updated = lp.clock.Now()
+
+	if err := saveSocEstimate(lp.socEstimateVehicle, se); err != nil {
+		lp.log.ERROR.Printf("soc estimate: %v", err)
+	}
+}
+
+// restoreSocEstimate seeds a freshly created estimator from the persisted
+// record. Called right after NewEstimator, i.e. on every vehicle connect.
+func (lp *Loadpoint) restoreSocEstimate() {
+	if lp.socEstimator == nil || lp.socEstimateVehicle == "" {
+		return
+	}
+
+	se, ok := loadSocEstimate(lp.socEstimateVehicle)
+	if !ok {
+		return
+	}
+
+	// the gradient is a property of the car and always worth keeping; the
+	// offset only if the record is still plausible. Should the source have
+	// moved on while evcc was down, the estimator's rebase branch drops the
+	// offset on the first poll — see the comment on plausible().
+	if !se.plausible(lp.clock.Now()) {
+		lp.log.DEBUG.Printf("soc estimate: offset discarded, keeping gradient %.1f Wh/%%", se.EnergyPerSocStep)
+		lp.socEstimator.Restore(se.AnchorSoc, 0, se.EnergyPerSocStep, lp.GetChargedEnergy(), se.Samples > 0)
+		lp.socEstimateBase = 0
+		return
+	}
+
+	lp.socEstimator.Restore(se.AnchorSoc, se.EnergySinceAnchor, se.EnergyPerSocStep, lp.GetChargedEnergy(), se.Samples > 0)
+
+	// Restore already folds energySinceAnchor into the estimator's own
+	// prevChargedEnergy (see its doc comment), so the freshly restored
+	// estimator's (VehicleSoc-PrevSoc)*EnergyPerSocStep already equals the
+	// full total since the anchor. socEstimateBase must therefore start at
+	// zero here — adding se.EnergySinceAnchor again in updateSocEstimate
+	// would double-count everything the estimator already carries forward.
+	lp.socEstimateBase = 0
+
+	lp.log.INFO.Printf("soc estimate restored: %.1f%% (anchor %.1f%%, %.0f Wh since)", se.soc(), se.AnchorSoc, se.EnergySinceAnchor)
+}

@@ -151,6 +151,10 @@ type Loadpoint struct {
 	coordinator    coordinator.API
 	socEstimator   *soc.Estimator
 
+	socEstimateVehicle  string  // name of the vehicle the estimate record belongs to
+	socEstimateBase     float64 // energy carried over from previous sessions, in Wh
+	socEstimateOdometer float64 // last odometer reading, in km
+
 	// charge planning
 	planner          *planner.Planner
 	planTime         time.Time        // time goal
@@ -1963,6 +1967,7 @@ func (lp *Loadpoint) publishSocAndRange() {
 		} else {
 			lp.vehicleSoc = socEstimator.Soc(socR, lp.GetChargedEnergy())
 			lp.log.DEBUG.Printf("vehicle soc (estimator): %.0f%%", lp.vehicleSoc)
+			lp.updateSocEstimate()
 		}
 	}
 	lp.publish(keys.VehicleSoc, lp.vehicleSoc)

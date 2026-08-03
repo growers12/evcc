@@ -149,6 +149,8 @@ func (lp *Loadpoint) setActiveVehicle(v api.Vehicle) {
 		// resolve optional config
 		if v.Capacity() > 0 && (lp.Soc.Estimate == nil || *lp.Soc.Estimate) {
 			lp.socEstimator = soc.NewEstimator(lp.log, lp.charger, v)
+			lp.socEstimateVehicle = vehicle.Settings(lp.log, v).Name()
+			lp.restoreSocEstimate()
 		}
 
 		lp.publish(keys.VehicleName, vehicle.Settings(lp.log, v).Name())
@@ -168,6 +170,7 @@ func (lp *Loadpoint) setActiveVehicle(v api.Vehicle) {
 		lp.progress.Reset()
 	} else {
 		lp.socEstimator = nil
+		lp.socEstimateVehicle = ""
 		lp.unpublishVehicleIdentity()
 	}
 
