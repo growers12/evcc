@@ -414,7 +414,7 @@ func TestClearSocEstimateWithoutVehicle(t *testing.T) {
 }
 
 // TestClearSocEstimateQueuesTask proves ClearSocEstimate enqueues rather than
-// dedicates via addTask, without running the closure (see the comment on
+// deduplicates via addTask, without running the closure (see the comment on
 // TestClearSocEstimateWithoutVehicle for why the delete itself stays
 // untested at this level).
 func TestClearSocEstimateQueuesTask(t *testing.T) {
