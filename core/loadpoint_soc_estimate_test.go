@@ -374,6 +374,32 @@ func TestSetSocEstimateAppliesTarget(t *testing.T) {
 	assert.InDelta(t, 42.0, se.soc(), 0.01, "the persisted record must follow the override")
 }
 
+// TestSetSocEstimateNoGradient covers soc.Estimator.SetSoc's internal
+// "no gradient available" error branch inside the queued closure: a vehicle
+// with 0 capacity makes NewEstimator derive energyPerSocStep 0 directly, so
+// SetSoc refuses the override. The closure must log and return without
+// panicking or touching the persisted record.
+func TestSetSocEstimateNoGradient(t *testing.T) {
+	lp := NewLoadpoint(util.NewLogger("test"), coresettings.NewDatabaseSettingsAdapter("test."))
+	lp.socEstimateVehicle = "test:nogradient"
+
+	ctrl := gomock.NewController(t)
+	vehicle := api.NewMockVehicle(ctrl)
+	vehicle.EXPECT().Capacity().Return(0.0).AnyTimes()
+	lp.socEstimator = soc.NewEstimator(lp.log, api.NewMockCharger(ctrl), vehicle)
+
+	require.NoError(t, lp.SetSocEstimate(42))
+
+	task, ok := lp.tasks.Dequeue()
+	require.True(t, ok)
+
+	assert.NotPanics(t, func() { task() })
+	assert.Equal(t, 0.0, lp.socEstimator.State().VehicleSoc, "the override must not apply without a gradient")
+
+	_, ok = loadSocEstimate("test:nogradient")
+	assert.False(t, ok, "no gradient means updateSocEstimate is never reached")
+}
+
 // TestShiftSocEstimateAppliesShift is the ShiftSocEstimate counterpart of
 // TestSetSocEstimateAppliesTarget, and additionally covers the kwh -> Wh
 // conversion at the api boundary: soc.Estimator.ShiftEnergy takes Wh, but
@@ -398,6 +424,61 @@ func TestShiftSocEstimateAppliesShift(t *testing.T) {
 	task()
 
 	assert.InDelta(t, before+10, lp.socEstimator.State().VehicleSoc, 0.01, "ShiftSocEstimate must convert kWh to Wh before calling ShiftEnergy")
+}
+
+// TestSetSocEstimateSurvivesEstimatorClearedBeforeRun and
+// TestShiftSocEstimateSurvivesEstimatorClearedBeforeRun reproduce the exact
+// interleaving that crashed the process: enqueue while socEstimator is set,
+// then let a concurrent setActiveVehicle clear it - reachable from the HTTP
+// and MQTT vehicle-select paths, not only through the task queue - before the
+// queued task drains. Before the fix, the closure re-read lp.socEstimator at
+// execution time and dereferenced nil; processTasks has no recover(), so
+// that nil dereference would crash the whole evcc process, not just fail the
+// request. RED for these tests is a panic (caught here via assert.NotPanics,
+// since a real crash would take down the whole test binary rather than fail
+// a single test).
+func TestSetSocEstimateSurvivesEstimatorClearedBeforeRun(t *testing.T) {
+	lp := NewLoadpoint(util.NewLogger("test"), coresettings.NewDatabaseSettingsAdapter("test."))
+
+	ctrl := gomock.NewController(t)
+	vehicle := api.NewMockVehicle(ctrl)
+	vehicle.EXPECT().Capacity().Return(8.5).AnyTimes()
+	lp.socEstimator = soc.NewEstimator(lp.log, api.NewMockCharger(ctrl), vehicle)
+
+	require.NoError(t, lp.SetSocEstimate(42))
+
+	// simulate setActiveVehicle clearing the estimator between enqueue and
+	// drain (vehicle disconnect/swap running concurrently with the queued task)
+	lp.socEstimator = nil
+
+	task, ok := lp.tasks.Dequeue()
+	require.True(t, ok)
+
+	assert.NotPanics(t, func() { task() })
+
+	_, _, estOk := lp.GetSocEstimate()
+	assert.False(t, estOk, "the loadpoint estimate must stay absent once the estimator is gone")
+}
+
+func TestShiftSocEstimateSurvivesEstimatorClearedBeforeRun(t *testing.T) {
+	lp := NewLoadpoint(util.NewLogger("test"), coresettings.NewDatabaseSettingsAdapter("test."))
+
+	ctrl := gomock.NewController(t)
+	vehicle := api.NewMockVehicle(ctrl)
+	vehicle.EXPECT().Capacity().Return(8.5).AnyTimes()
+	lp.socEstimator = soc.NewEstimator(lp.log, api.NewMockCharger(ctrl), vehicle)
+
+	require.NoError(t, lp.ShiftSocEstimate(1.5))
+
+	lp.socEstimator = nil
+
+	task, ok := lp.tasks.Dequeue()
+	require.True(t, ok)
+
+	assert.NotPanics(t, func() { task() })
+
+	_, _, estOk := lp.GetSocEstimate()
+	assert.False(t, estOk, "the loadpoint estimate must stay absent once the estimator is gone")
 }
 
 // TestClearSocEstimateWithoutVehicle covers the synchronous guard in

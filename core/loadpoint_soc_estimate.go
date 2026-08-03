@@ -262,8 +262,19 @@ func (lp *Loadpoint) GetSocEstimate() (soc.State, SocEstimate, bool) {
 
 // SetSocEstimate overrides the estimated soc. It runs inside the loadpoint
 // task queue so the estimator is never touched from the HTTP goroutine.
+//
+// estimator is snapshotted here, on the caller's goroutine, and the closure
+// below closes over that local instead of re-reading lp.socEstimator at task
+// execution time. Between enqueueing and draining, setActiveVehicle can set
+// lp.socEstimator to nil or a different instance (reachable from the HTTP and
+// MQTT vehicle-select paths, not only through the task queue) - re-reading
+// the field inside the closure would risk a nil dereference in processTasks,
+// which has no recover() and would crash the whole process. Same reasoning
+// as ClearSocEstimate snapshotting the vehicle name, and as the race-guard
+// comment on updateSocEstimate referencing evcc issue 16180.
 func (lp *Loadpoint) SetSocEstimate(v float64) error {
-	if lp.socEstimator == nil {
+	estimator := lp.socEstimator
+	if estimator == nil {
 		return ErrNoSocEstimator
 	}
 
@@ -272,12 +283,19 @@ func (lp *Loadpoint) SetSocEstimate(v float64) error {
 	}
 
 	lp.enqueueTask(func() {
-		if err := lp.socEstimator.SetSoc(v); err != nil {
+		// defensive: estimator is a snapshot taken before enqueueing and is
+		// never nil here, but check anyway - consistent with the nil check
+		// updateSocEstimate itself already performs on its estimator param.
+		if estimator == nil {
+			return
+		}
+
+		if err := estimator.SetSoc(v); err != nil {
 			lp.log.ERROR.Printf("soc estimate: %v", err)
 			return
 		}
 
-		lp.updateSocEstimate(lp.socEstimator)
+		lp.updateSocEstimate(estimator)
 		lp.log.INFO.Printf("soc estimate set to %.1f%%", v)
 	})
 	lp.requestUpdate()
@@ -285,19 +303,26 @@ func (lp *Loadpoint) SetSocEstimate(v float64) error {
 	return nil
 }
 
-// ShiftSocEstimate moves the energy anchor by kwh
+// ShiftSocEstimate moves the energy anchor by kwh. See the SetSocEstimate
+// doc comment for why estimator is snapshotted before enqueueing rather than
+// re-read from lp.socEstimator inside the closure.
 func (lp *Loadpoint) ShiftSocEstimate(kwh float64) error {
-	if lp.socEstimator == nil {
+	estimator := lp.socEstimator
+	if estimator == nil {
 		return ErrNoSocEstimator
 	}
 
 	lp.enqueueTask(func() {
-		if err := lp.socEstimator.ShiftEnergy(kwh * 1e3); err != nil {
+		if estimator == nil {
+			return
+		}
+
+		if err := estimator.ShiftEnergy(kwh * 1e3); err != nil {
 			lp.log.ERROR.Printf("soc estimate: %v", err)
 			return
 		}
 
-		lp.updateSocEstimate(lp.socEstimator)
+		lp.updateSocEstimate(estimator)
 		lp.log.INFO.Printf("soc estimate shifted by %.2f kWh", kwh)
 	})
 	lp.requestUpdate()
