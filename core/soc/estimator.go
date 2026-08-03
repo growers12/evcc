@@ -32,6 +32,8 @@ type Estimator struct {
 	prevSoc           float64 // previous vehicle Soc in %
 	prevChargedEnergy float64 // previous charged energy in Wh
 	energyPerSocStep  float64 // Energy per Soc percent in Wh
+	fetchedSoc        float64 // last soc value received from vehicle or charger
+	learned           bool    // true once the gradient was recalculated from measurements
 }
 
 // NewEstimator creates new estimator
@@ -97,6 +99,7 @@ func remainingChargeEnergy(targetSoc int, vehicleSoc, virtualCapacity float64) f
 func (s *Estimator) Soc(fetchedSoc *float64, chargedEnergy float64) float64 {
 	if fetchedSoc != nil {
 		s.vehicleSoc = *fetchedSoc
+		s.fetchedSoc = *fetchedSoc
 	} else {
 		s.log.WARN.Printf("missing vehicle soc- ignored by estimator")
 	}
@@ -116,6 +119,7 @@ func (s *Estimator) Soc(fetchedSoc *float64, chargedEnergy float64) float64 {
 		// recalculate gradient, wh per soc %
 		if socDiff > 10 && energyDiff > 0 {
 			s.energyPerSocStep = energyDiff / socDiff
+			s.learned = true
 			s.virtualCapacity = max(s.vehicle.Capacity()*1e3, s.energyPerSocStep*100)
 			s.log.DEBUG.Printf("soc gradient updated: soc: %.1f%%, socDiff: %.1f%%, energyDiff: %.0fWh, energyPerSocStep: %.1fWh, virtualCapacity: %.0fWh", s.vehicleSoc, socDiff, energyDiff, s.energyPerSocStep, s.virtualCapacity)
 		}
