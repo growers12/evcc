@@ -175,17 +175,28 @@ func (lp *Loadpoint) updateSocEstimate(estimator *soc.Estimator) {
 
 		if learnedThisCall {
 			lp.log.INFO.Printf("soc gradient learned: %.1f Wh/%% (%d samples)", se.EnergyPerSocStep, se.Samples)
+
+			// push the learned gradient into the live estimator, not just the
+			// persisted record — otherwise it only survives until the next
+			// poll, when st.EnergyPerSocStep (read from the estimator, which
+			// nobody but Restore ever updates) is mirrored back below and
+			// silently reverts the just-learned value. Restore is idempotent
+			// here: the estimator just rebased onto exactly this anchor and
+			// energy, so every field it writes except the gradient itself is
+			// a no-op — see prevSoc/fetchedSoc/vehicleSoc/prevChargedEnergy
+			// against soc.Estimator.Soc's rebase branch above.
+			estimator.Restore(se.AnchorSoc, 0, se.EnergyPerSocStep, lp.GetChargedEnergy(), true)
 		}
 	}
 
 	// energy the estimator currently attributes to this anchor
 	se.EnergySinceAnchor = (st.VehicleSoc - st.PrevSoc) * st.EnergyPerSocStep
 
-	// outside a learning call, mirror the live estimator's own gradient (e.g.
-	// its upstream in-session learner, see soc.Estimator.Soc). A gradient just
-	// learned above must survive this line rather than be overwritten by the
-	// stale value the estimator still holds — it only sees the fresh reading
-	// on its *next* poll.
+	// outside a learning call this call, mirror the live estimator's own
+	// gradient (e.g. its upstream in-session learner, see soc.Estimator.Soc).
+	// A gradient learned above this call must survive this line — st was
+	// captured before the Restore() push above and still holds the pre-learn
+	// value; on later calls st and se already agree, so this line is a no-op.
 	if !learnedThisCall {
 		se.EnergyPerSocStep = st.EnergyPerSocStep
 	}

@@ -225,7 +225,14 @@ func TestLearnCountsSamples(t *testing.T) {
 
 // TestUpdateSocEstimateLearnsAcrossSessionBoundary exercises learn() through
 // updateSocEstimate end to end, guarding against the bookkeeping block below
-// the rebase silently overwriting a gradient that was just learned.
+// the rebase silently overwriting a gradient that was just learned, and that
+// it keeps holding on later polls rather than being clobbered one cycle
+// later by the estimator's own (still-stale) gradient — see production's
+// call pattern in publishSocAndRange: socEstimator.Soc(socR,
+// lp.GetChargedEnergy()) followed by lp.updateSocEstimate(socEstimator),
+// both reading the same lp.GetChargedEnergy(). The test drives
+// lp.energyMetrics directly (rather than passing ad-hoc numbers to Soc)
+// so that coupling is real, not assumed.
 func TestUpdateSocEstimateLearnsAcrossSessionBoundary(t *testing.T) {
 	lp := NewLoadpoint(util.NewLogger("test"), coresettings.NewDatabaseSettingsAdapter("test."))
 
@@ -239,19 +246,22 @@ func TestUpdateSocEstimateLearnsAcrossSessionBoundary(t *testing.T) {
 	// session 1: anchor at 15%, source frozen, 4800 Wh delivered
 	lp.socEstimator = soc.NewEstimator(lp.log, api.NewMockCharger(ctrl), vehicle)
 	source := 15.0
-	lp.socEstimator.Soc(&source, 0)
+	lp.socEstimator.Soc(&source, lp.GetChargedEnergy())
 	lp.updateSocEstimate(lp.socEstimator)
-	lp.socEstimator.Soc(&source, 4800)
+	lp.energyMetrics.Update(4.8) // 4800 Wh
+	lp.socEstimator.Soc(&source, lp.GetChargedEnergy())
 	lp.updateSocEstimate(lp.socEstimator)
 
-	// unplug, drive 2km (within the guard), replug: fresh estimator restores the anchor
+	// unplug, drive 2km (within the guard), replug: fresh estimator and fresh
+	// session energy counter, restore folds the persisted anchor back in
 	lp.socEstimateOdometer = 28013
+	lp.energyMetrics.Reset()
 	lp.socEstimator = soc.NewEstimator(lp.log, api.NewMockCharger(ctrl), vehicle)
 	lp.restoreSocEstimate()
 
 	// the car finally reports the real value: a clean 40 point rise
 	source = 55.0
-	lp.socEstimator.Soc(&source, 0)
+	lp.socEstimator.Soc(&source, lp.GetChargedEnergy())
 	lp.updateSocEstimate(lp.socEstimator)
 
 	se, ok := loadSocEstimate("test:6")
@@ -259,6 +269,24 @@ func TestUpdateSocEstimateLearnsAcrossSessionBoundary(t *testing.T) {
 	// measured 4800/40 = 120, EMA 0.7*100 + 0.3*120 = 106
 	assert.InDelta(t, 106.0, se.EnergyPerSocStep, 0.01, "learned gradient must survive the persisted record")
 	assert.Equal(t, 1, se.Samples)
+
+	// two more polls after the learning call: the source stays caught up at
+	// 55% while more energy is delivered. Both the persisted record and the
+	// live estimator must keep reading the learned gradient, not the stale
+	// pre-learn value.
+	lp.energyMetrics.Update(0.05) // +50 Wh
+	lp.socEstimator.Soc(&source, lp.GetChargedEnergy())
+	lp.updateSocEstimate(lp.socEstimator)
+
+	lp.energyMetrics.Update(0.10) // +50 Wh more
+	lp.socEstimator.Soc(&source, lp.GetChargedEnergy())
+	lp.updateSocEstimate(lp.socEstimator)
+
+	se, ok = loadSocEstimate("test:6")
+	require.True(t, ok)
+	assert.InDelta(t, 106.0, se.EnergyPerSocStep, 0.01, "gradient must survive polls after the learning call")
+	assert.Equal(t, 1, se.Samples, "no further learning happens while the source stays caught up")
+	assert.InDelta(t, 106.0, lp.socEstimator.State().EnergyPerSocStep, 0.01, "the live estimator must also carry the learned gradient")
 }
 
 func TestRestoreSocEstimateDropsExpiredOffset(t *testing.T) {
