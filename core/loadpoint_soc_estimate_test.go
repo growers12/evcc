@@ -4,9 +4,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/benbjohnson/clock"
 	"github.com/evcc-io/evcc/api"
+	"github.com/evcc-io/evcc/core/session"
 	coresettings "github.com/evcc-io/evcc/core/settings"
 	"github.com/evcc-io/evcc/core/soc"
+	serverdb "github.com/evcc-io/evcc/server/db"
 	"github.com/evcc-io/evcc/util"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -548,6 +551,85 @@ func TestRestoreSocEstimateDropsExpiredOffset(t *testing.T) {
 	st := lp.socEstimator.State()
 	assert.Equal(t, 15.0, st.VehicleSoc, "offset discarded: vehicle soc falls back to the anchor")
 	assert.Equal(t, 100.0, st.EnergyPerSocStep, "gradient survives even when the offset is discarded")
+}
+
+// TestRestoreSocEstimateSurvivesSessionCounterReset walks the vehicle connect
+// path in production order. evVehicleConnectHandler runs
+// vehicleDefaultOrDetect (-> setActiveVehicle -> restoreSocEstimate) first and
+// createSession (-> energyMetrics.Reset) second, so the anchor is applied
+// against the *previous* session's counter and one call later that counter is
+// zeroed underneath it. Both halves must be driven through lp.energyMetrics
+// and lp.createSession() here rather than through ad-hoc numbers, or the test
+// silently models an order production never takes.
+//
+// Without the re-anchor in createSession the first poll after the connect
+// collapses the estimate onto the raw source value and updateSocEstimate then
+// overwrites the persisted record with a zero offset - the estimate is not
+// just mis-displayed, its history is destroyed.
+func TestRestoreSocEstimateSurvivesSessionCounterReset(t *testing.T) {
+	var err error
+	serverdb.Instance, err = serverdb.New("sqlite", ":memory:")
+	require.NoError(t, err)
+
+	store, err := session.NewStore("foo", serverdb.Instance)
+	require.NoError(t, err)
+
+	clk := clock.NewMock()
+
+	ctrl := gomock.NewController(t)
+
+	mm := api.NewMockMeter(ctrl)
+	me := api.NewMockMeterEnergy(ctrl)
+
+	type EnergyDecorator struct {
+		api.Meter
+		api.MeterEnergy
+	}
+
+	lp := &Loadpoint{
+		log:         util.NewLogger("foo"),
+		clock:       clk,
+		db:          store,
+		chargeMeter: &EnergyDecorator{Meter: mm, MeterEnergy: me},
+	}
+
+	vehicle := api.NewMockVehicle(ctrl)
+	vehicle.EXPECT().Capacity().Return(82.0).AnyTimes()
+
+	// the EX40's numbers from the 2026-08-03 incident: 82 kWh nominal gives
+	// 964.7 Wh per point, 6800 Wh above a 15% anchor is an estimate of 22.05%
+	const eps = 82000 / soc.ChargeEfficiency / 100
+
+	require.NoError(t, saveSocEstimate("test:counterreset", SocEstimate{
+		AnchorSoc: 15, EnergySinceAnchor: 6800, EnergyPerSocStep: eps, Updated: clk.Now(),
+	}))
+	lp.socEstimateVehicle = "test:counterreset"
+
+	// at connect time the counter still holds the previous session's total -
+	// energyMetrics is only ever reset from createSession
+	lp.energyMetrics.Update(6.8)
+	require.Equal(t, 6800.0, lp.GetChargedEnergy())
+
+	// setActiveVehicle: fresh estimator, anchor restored against that counter
+	lp.socEstimator = soc.NewEstimator(lp.log, api.NewMockCharger(ctrl), vehicle)
+	lp.restoreSocEstimate()
+	require.InDelta(t, 22.05, lp.socEstimator.State().VehicleSoc, 0.01)
+
+	// createSession: the counter the anchor was just computed against is gone
+	me.EXPECT().TotalEnergy().Return(10.0, nil)
+	lp.createSession()
+	require.Zero(t, lp.GetChargedEnergy(), "createSession must have reset the session counter")
+
+	// first poll after the connect, the car still reports the frozen anchor
+	source := 15.0
+	got := lp.socEstimator.Soc(&source, lp.GetChargedEnergy())
+	assert.InDelta(t, 22.05, got, 0.01, "the restored estimate must survive the session counter reset")
+
+	lp.updateSocEstimate(lp.socEstimator)
+
+	se, ok := loadSocEstimate("test:counterreset")
+	require.True(t, ok)
+	assert.InDelta(t, 6800.0, se.EnergySinceAnchor, 1, "the persisted record must not be overwritten with a zero offset")
 }
 
 func TestLoadSocEstimateExported(t *testing.T) {

@@ -60,6 +60,15 @@ func (lp *Loadpoint) createSession() {
 
 	// energy
 	lp.energyMetrics.Reset()
+
+	// the soc estimate's energy anchor is relative to this counter, and this is
+	// the only place in evcc that resets it. Whoever built the estimator did so
+	// against the *previous* session's total (evVehicleConnectHandler runs
+	// vehicleDefaultOrDetect before createSession, splitSession likewise
+	// switches the vehicle first), so the anchor has to be re-applied here or
+	// the first poll of the new session reads the raw source value again.
+	lp.restoreSocEstimate()
+
 	lp.energyMetrics.Publish("session", lp)
 	lp.publish(keys.ChargedEnergy, lp.GetChargedEnergy())
 }

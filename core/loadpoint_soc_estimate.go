@@ -193,12 +193,16 @@ func (lp *Loadpoint) updateSocEstimate(estimator *soc.Estimator) {
 			// persisted record — otherwise it only survives until the next
 			// poll, when st.EnergyPerSocStep (read from the estimator, which
 			// nobody but Restore ever updates) is mirrored back below and
-			// silently reverts the just-learned value. Restore is idempotent
-			// here: the estimator just rebased onto exactly this anchor and
-			// energy, so every field it writes except the gradient itself is
-			// a no-op — see prevSoc/fetchedSoc/vehicleSoc/prevChargedEnergy
-			// against soc.Estimator.Soc's rebase branch above.
-			estimator.Restore(se.AnchorSoc, 0, se.EnergyPerSocStep, lp.GetChargedEnergy(), true)
+			// silently reverts the just-learned value.
+			//
+			// Restore changes energyPerSocStep, virtualCapacity and learned
+			// here and nothing else: the estimator just rebased onto exactly
+			// this anchor, so prevSoc, fetchedSoc and vehicleSoc already equal
+			// se.AnchorSoc and prevChargedEnergy already equals
+			// st.PrevChargedEnergy. Passing st.PrevChargedEnergy rather than
+			// lp.GetChargedEnergy() keeps that exact by construction instead
+			// of by assuming the counter has not moved since the poll.
+			estimator.Restore(se.AnchorSoc, 0, se.EnergyPerSocStep, st.PrevChargedEnergy, true)
 		}
 	}
 
@@ -220,8 +224,19 @@ func (lp *Loadpoint) updateSocEstimate(estimator *soc.Estimator) {
 	}
 }
 
-// restoreSocEstimate seeds a freshly created estimator from the persisted
-// record. Called right after NewEstimator, i.e. on every vehicle connect.
+// restoreSocEstimate seeds an estimator from the persisted record.
+//
+// Called from two places, and it has to be both: setActiveVehicle right after
+// NewEstimator, because a mid-session vehicle change gets no new session; and
+// createSession right after energyMetrics.Reset(), because the anchor is
+// relative to that counter and setActiveVehicle always runs before the reset.
+// On the connect and split paths it therefore runs twice, the second call
+// winning - Restore only ever reads the record and writes estimator fields, so
+// repeating it is harmless.
+//
+// Deliberately *not* solved by making Restore defer the anchor to the first
+// Soc() call: between a mid-session vehicle change and the next poll real
+// energy flows, and a deferred anchor would silently swallow it.
 func (lp *Loadpoint) restoreSocEstimate() {
 	if lp.socEstimator == nil || lp.socEstimateVehicle == "" {
 		return
