@@ -1,5 +1,10 @@
 package soc
 
+import (
+	"errors"
+	"fmt"
+)
+
 // State is a snapshot of the estimator's internal state. It exists so the
 // estimate can be inspected and persisted from outside the package.
 type State struct {
@@ -27,4 +32,41 @@ func (s *Estimator) State() State {
 		VirtualCapacity:   s.virtualCapacity,
 		Learned:           s.learned,
 	}
+}
+
+// SetSoc shifts the energy anchor so the estimate reads target percent.
+//
+// The estimate is recomputed from the fetched value on every poll
+// (vehicleSoc = fetchedSoc + energyDelta/energyPerSocStep), so assigning
+// vehicleSoc alone would not survive. Shifting prevChargedEnergy does:
+//
+//	prevChargedEnergy_new = prevChargedEnergy_old - (target - current) * energyPerSocStep
+//
+// prevSoc, initialSoc and initialEnergy are deliberately left untouched.
+// prevSoc must keep matching the source value, otherwise socDelta != 0 sends
+// the next poll into the rebase branch and drops the override immediately.
+// initialSoc/initialEnergy anchor the upstream gradient learner.
+func (s *Estimator) SetSoc(target float64) error {
+	if target < 0 || target > 100 {
+		return fmt.Errorf("soc out of range: %.1f", target)
+	}
+
+	if s.energyPerSocStep <= 0 {
+		return errors.New("no gradient available")
+	}
+
+	s.prevChargedEnergy -= (target - s.vehicleSoc) * s.energyPerSocStep
+	s.vehicleSoc = target
+
+	return nil
+}
+
+// ShiftEnergy moves the energy anchor by wh, raising the estimate for
+// positive and lowering it for negative values.
+func (s *Estimator) ShiftEnergy(wh float64) error {
+	if s.energyPerSocStep <= 0 {
+		return errors.New("no gradient available")
+	}
+
+	return s.SetSoc(s.vehicleSoc + wh/s.energyPerSocStep)
 }
