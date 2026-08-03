@@ -70,3 +70,25 @@ func (s *Estimator) ShiftEnergy(wh float64) error {
 
 	return s.SetSoc(s.vehicleSoc + wh/s.energyPerSocStep)
 }
+
+// Restore seeds a fresh estimator from a persisted record.
+//
+// chargedEnergy is the loadpoint's current session counter, which the anchor
+// is relative to — it is not necessarily zero, evcc may have restarted
+// mid-session.
+//
+// Setting prevSoc to the anchor is essential: a fresh estimator has prevSoc 0,
+// so the first poll would produce socDelta != 0, take the rebase branch and
+// discard everything restored here.
+func (s *Estimator) Restore(anchorSoc, energySinceAnchor, energyPerSocStep, chargedEnergy float64, learned bool) {
+	if energyPerSocStep > 0 {
+		s.energyPerSocStep = energyPerSocStep
+		s.virtualCapacity = max(s.vehicle.Capacity()*1e3, energyPerSocStep*100)
+		s.learned = learned
+	}
+
+	s.prevSoc = anchorSoc
+	s.fetchedSoc = anchorSoc
+	s.prevChargedEnergy = chargedEnergy - energySinceAnchor
+	s.vehicleSoc = min(anchorSoc+energySinceAnchor/s.energyPerSocStep, 100)
+}

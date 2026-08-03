@@ -101,3 +101,46 @@ func TestShiftEnergy(t *testing.T) {
 	assert.Equal(t, 20.0, ce.State().VehicleSoc)
 	assert.Equal(t, 20.0, ce.Soc(&source, 0))
 }
+
+func TestRestoreSeedsEstimate(t *testing.T) {
+	ce := newTestEstimator(t)
+
+	// 500 Wh since the anchor at 15% => 20% at 100 Wh per point
+	ce.Restore(15, 500, 100, 0, true)
+
+	st := ce.State()
+	assert.Equal(t, 20.0, st.VehicleSoc)
+	assert.Equal(t, 15.0, st.PrevSoc, "prevSoc must equal the anchor")
+	assert.True(t, st.Learned)
+}
+
+func TestRestoreFirstPollDoesNotRebase(t *testing.T) {
+	ce := newTestEstimator(t)
+	ce.Restore(15, 500, 100, 0, true)
+
+	// a fresh estimator has prevSoc 0; without Restore setting it to the anchor
+	// this first poll would take the rebase branch and wipe the restored offset
+	source := 15.0
+	assert.Equal(t, 20.0, ce.Soc(&source, 0), "restored estimate must survive the first poll")
+	assert.InDelta(t, 22.0, ce.Soc(&source, 200), 0.001)
+}
+
+func TestRestoreKeepsGradientWithoutOffset(t *testing.T) {
+	ce := newTestEstimator(t)
+
+	ce.Restore(15, 0, 250, 0, true)
+
+	st := ce.State()
+	assert.Equal(t, 250.0, st.EnergyPerSocStep, "gradient is restored unconditionally")
+	assert.Equal(t, 15.0, st.VehicleSoc, "no energy since anchor means no offset")
+}
+
+func TestRestoreWithRunningSessionEnergy(t *testing.T) {
+	ce := newTestEstimator(t)
+
+	// evcc restarted mid-session: the counter already stands at 800 Wh
+	ce.Restore(15, 500, 100, 800, true)
+
+	source := 15.0
+	assert.Equal(t, 20.0, ce.Soc(&source, 800), "anchor is relative to the current counter")
+}
