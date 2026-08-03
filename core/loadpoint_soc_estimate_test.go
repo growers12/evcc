@@ -289,6 +289,118 @@ func TestUpdateSocEstimateLearnsAcrossSessionBoundary(t *testing.T) {
 	assert.InDelta(t, 106.0, lp.socEstimator.State().EnergyPerSocStep, 0.01, "the live estimator must also carry the learned gradient")
 }
 
+func TestSetSocEstimateWithoutEstimator(t *testing.T) {
+	lp := NewLoadpoint(util.NewLogger("test"), coresettings.NewDatabaseSettingsAdapter("test."))
+
+	assert.Error(t, lp.SetSocEstimate(20))
+	assert.Error(t, lp.ShiftSocEstimate(1.5))
+
+	_, _, ok := lp.GetSocEstimate()
+	assert.False(t, ok)
+}
+
+// TestSetSocEstimateOutOfRange covers the synchronous validation in
+// SetSocEstimate, which must reject before ever touching the task queue -
+// an out-of-range target must not reach the estimator at all.
+func TestSetSocEstimateOutOfRange(t *testing.T) {
+	lp := NewLoadpoint(util.NewLogger("test"), coresettings.NewDatabaseSettingsAdapter("test."))
+
+	ctrl := gomock.NewController(t)
+	vehicle := api.NewMockVehicle(ctrl)
+	vehicle.EXPECT().Capacity().Return(8.5).AnyTimes()
+	lp.socEstimator = soc.NewEstimator(lp.log, api.NewMockCharger(ctrl), vehicle)
+
+	assert.Error(t, lp.SetSocEstimate(-1))
+	assert.Error(t, lp.SetSocEstimate(101))
+	assert.Equal(t, 0, lp.tasks.Size(), "an out-of-range target must never reach the task queue")
+}
+
+// TestSetSocEstimateQueuesTask and TestShiftSocEstimateQueuesTask mirror
+// TestSplitSessionQueuesEverySplit: they check that both methods use
+// enqueueTask rather than addTask, i.e. that a second call is not silently
+// dropped because it shares the same closure's code pointer. The tasks are
+// deliberately left unrun - running them would exercise updateSocEstimate,
+// which persists via saveSocEstimate/settings.SetJson and only touches the
+// in-memory settings slice, so that part would be safe; but there is no
+// reason to actually execute the closures here, only to prove they were
+// enqueued.
+func TestSetSocEstimateQueuesTask(t *testing.T) {
+	lp := NewLoadpoint(util.NewLogger("test"), coresettings.NewDatabaseSettingsAdapter("test."))
+
+	ctrl := gomock.NewController(t)
+	vehicle := api.NewMockVehicle(ctrl)
+	vehicle.EXPECT().Capacity().Return(8.5).AnyTimes()
+	lp.socEstimator = soc.NewEstimator(lp.log, api.NewMockCharger(ctrl), vehicle)
+
+	require.NoError(t, lp.SetSocEstimate(20))
+	require.NoError(t, lp.SetSocEstimate(40))
+
+	assert.Equal(t, 2, lp.tasks.Size(), "second call must not be deduplicated away")
+}
+
+func TestShiftSocEstimateQueuesTask(t *testing.T) {
+	lp := NewLoadpoint(util.NewLogger("test"), coresettings.NewDatabaseSettingsAdapter("test."))
+
+	ctrl := gomock.NewController(t)
+	vehicle := api.NewMockVehicle(ctrl)
+	vehicle.EXPECT().Capacity().Return(8.5).AnyTimes()
+	lp.socEstimator = soc.NewEstimator(lp.log, api.NewMockCharger(ctrl), vehicle)
+
+	require.NoError(t, lp.ShiftSocEstimate(1.5))
+	require.NoError(t, lp.ShiftSocEstimate(-2.0))
+
+	assert.Equal(t, 2, lp.tasks.Size(), "second call must not be deduplicated away")
+}
+
+// TestClearSocEstimateWithoutVehicle covers the synchronous guard in
+// ClearSocEstimate. This deliberately does not exercise the queued
+// deleteSocEstimate call: settings.Delete reaches the package-level
+// db.Instance without a nil check as soon as the key already exists in the
+// in-memory settings slice, and a bare `go test ./core/` has no database.
+// See the ClearSocEstimate doc comment / task report for the full reasoning.
+func TestClearSocEstimateWithoutVehicle(t *testing.T) {
+	lp := NewLoadpoint(util.NewLogger("test"), coresettings.NewDatabaseSettingsAdapter("test."))
+
+	assert.ErrorIs(t, lp.ClearSocEstimate(), ErrNoSocEstimator)
+	assert.Equal(t, 0, lp.tasks.Size(), "without a vehicle name there is nothing to enqueue")
+}
+
+// TestClearSocEstimateQueuesTask proves ClearSocEstimate enqueues rather than
+// dedicates via addTask, without running the closure (see the comment on
+// TestClearSocEstimateWithoutVehicle for why the delete itself stays
+// untested at this level).
+func TestClearSocEstimateQueuesTask(t *testing.T) {
+	lp := NewLoadpoint(util.NewLogger("test"), coresettings.NewDatabaseSettingsAdapter("test."))
+	lp.socEstimateVehicle = "test:clear"
+
+	require.NoError(t, lp.ClearSocEstimate())
+	require.NoError(t, lp.ClearSocEstimate())
+
+	assert.Equal(t, 2, lp.tasks.Size(), "second call must not be deduplicated away")
+}
+
+// TestGetSocEstimateReturnsState covers the ok=true path: a live estimator
+// plus a persisted record. loadSocEstimate only reads the in-memory settings
+// slice (settings.String), so this does not touch db.Instance.
+func TestGetSocEstimateReturnsState(t *testing.T) {
+	lp := NewLoadpoint(util.NewLogger("test"), coresettings.NewDatabaseSettingsAdapter("test."))
+
+	ctrl := gomock.NewController(t)
+	vehicle := api.NewMockVehicle(ctrl)
+	vehicle.EXPECT().Capacity().Return(8.5).AnyTimes()
+	lp.socEstimator = soc.NewEstimator(lp.log, api.NewMockCharger(ctrl), vehicle)
+	lp.socEstimateVehicle = "test:get"
+
+	require.NoError(t, saveSocEstimate("test:get", SocEstimate{AnchorSoc: 33, EnergyPerSocStep: 100}))
+
+	st, se, ok := lp.GetSocEstimate()
+	assert.True(t, ok)
+	assert.Equal(t, 33.0, se.AnchorSoc, "the persisted record must be returned alongside the live state")
+	// a fresh estimator with no polls yet reports vehicleSoc 0, regardless of
+	// the persisted record above - GetSocEstimate does not merge the two
+	assert.Equal(t, 0.0, st.VehicleSoc)
+}
+
 func TestRestoreSocEstimateDropsExpiredOffset(t *testing.T) {
 	lp := NewLoadpoint(util.NewLogger("test"), coresettings.NewDatabaseSettingsAdapter("test."))
 

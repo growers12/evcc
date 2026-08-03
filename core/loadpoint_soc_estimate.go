@@ -1,6 +1,7 @@
 package core
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
@@ -240,4 +241,84 @@ func (lp *Loadpoint) vehicleCapacity() float64 {
 		return v.Capacity()
 	}
 	return 0
+}
+
+// ErrNoSocEstimator is returned when the loadpoint has no active estimator
+var ErrNoSocEstimator = errors.New("no soc estimator active")
+
+// GetSocEstimate returns the live estimator state and the persisted record
+func (lp *Loadpoint) GetSocEstimate() (soc.State, SocEstimate, bool) {
+	lp.RLock()
+	defer lp.RUnlock()
+
+	if lp.socEstimator == nil {
+		return soc.State{}, SocEstimate{}, false
+	}
+
+	se, _ := loadSocEstimate(lp.socEstimateVehicle)
+
+	return lp.socEstimator.State(), se, true
+}
+
+// SetSocEstimate overrides the estimated soc. It runs inside the loadpoint
+// task queue so the estimator is never touched from the HTTP goroutine.
+func (lp *Loadpoint) SetSocEstimate(v float64) error {
+	if lp.socEstimator == nil {
+		return ErrNoSocEstimator
+	}
+
+	if v < 0 || v > 100 {
+		return fmt.Errorf("soc out of range: %.1f", v)
+	}
+
+	lp.enqueueTask(func() {
+		if err := lp.socEstimator.SetSoc(v); err != nil {
+			lp.log.ERROR.Printf("soc estimate: %v", err)
+			return
+		}
+
+		lp.updateSocEstimate(lp.socEstimator)
+		lp.log.INFO.Printf("soc estimate set to %.1f%%", v)
+	})
+	lp.requestUpdate()
+
+	return nil
+}
+
+// ShiftSocEstimate moves the energy anchor by kwh
+func (lp *Loadpoint) ShiftSocEstimate(kwh float64) error {
+	if lp.socEstimator == nil {
+		return ErrNoSocEstimator
+	}
+
+	lp.enqueueTask(func() {
+		if err := lp.socEstimator.ShiftEnergy(kwh * 1e3); err != nil {
+			lp.log.ERROR.Printf("soc estimate: %v", err)
+			return
+		}
+
+		lp.updateSocEstimate(lp.socEstimator)
+		lp.log.INFO.Printf("soc estimate shifted by %.2f kWh", kwh)
+	})
+	lp.requestUpdate()
+
+	return nil
+}
+
+// ClearSocEstimate drops the persisted record and follows the source again
+func (lp *Loadpoint) ClearSocEstimate() error {
+	if lp.socEstimateVehicle == "" {
+		return ErrNoSocEstimator
+	}
+
+	name := lp.socEstimateVehicle
+
+	lp.enqueueTask(func() {
+		if err := deleteSocEstimate(name); err != nil {
+			lp.log.ERROR.Printf("soc estimate: %v", err)
+		}
+	})
+	lp.requestUpdate()
+
+	return nil
 }
