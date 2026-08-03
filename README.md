@@ -1,3 +1,23 @@
+> ### ⚠️ This is a fork, not upstream evcc
+>
+> Based on the **0.313.1** release tag, with additions for **vehicles that do not report their state
+> of charge while plugged in** — cars that sleep, sit without mobile reception, or whose cloud API
+> only refreshes when the car is awake:
+>
+> - the SoC estimate **survives an evcc restart** instead of falling back to the vehicle's stale
+>   reading (which, with `minSoc` set, otherwise triggers pointless grid charging)
+> - `energyPerSocStep` is **learned across the session boundary**, so the estimate stops relying on a
+>   static default that is typically ~15 % off
+> - endpoints to **read, correct and clear** the estimate
+> - `POST /api/loadpoints/{lp}/session/split` — end a charging session and start a new one **without
+>   unplugging**, for when a different car ends up on the same cable
+>
+> **→ [FORK.md](FORK.md)** for what each change does, the endpoints, and the traps a rebase reopens.
+>
+> The estimator work was offered upstream as
+> [evcc-io/evcc#32485](https://github.com/evcc-io/evcc/pull/32485) and declined; this fork is where it
+> is maintained. For anything else, please use [upstream evcc](https://github.com/evcc-io/evcc).
+
 # evcc 🚘☀️
 
 [![Build](https://github.com/evcc-io/evcc/actions/workflows/nightly.yml/badge.svg)](https://github.com/evcc-io/evcc/actions/workflows/nightly.yml)
