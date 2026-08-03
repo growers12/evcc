@@ -149,18 +149,25 @@ Give the old base **explicitly**. On a shallow clone git finds no merge base and
 
 ### 3. The conflict surface
 
-The fork adds four files that cannot conflict, and touches nine existing ones that can:
+Almost everything lives in files that upstream does not have, so it cannot conflict. Only **six
+existing files** are touched, and none of them by much — 99 added lines in total:
 
-| File | What we add |
-|---|---|
-| `server/http.go` | route map entries — **the most likely conflict**, upstream adds routes here regularly |
-| `core/loadpoint.go` | struct fields, one call in `publishSocAndRange` |
-| `core/loadpoint_session.go` | `SplitSession`/`splitSession`, the restore call in `createSession` |
-| `core/loadpoint_vehicle.go` | vehicle name bookkeeping in `setActiveVehicle` |
-| `core/site_vehicles.go` | one field in the published vehicle struct |
-| `core/soc/estimator.go` | two fields and their assignments |
-| `server/http_loadpoint_handler.go` | the session-split handler |
-| plus three `_test.go` files | |
+| File | +/− | What we add |
+|---|---|---|
+| `core/site_vehicles.go` | +29 | one field in the published vehicle struct, and its population |
+| `core/loadpoint.go` | +24 | struct fields, one call in `publishSocAndRange` |
+| `core/loadpoint_session.go` | +19/−1 | the restore call in `createSession`, charge-duration offset |
+| `core/loadpoint_vehicle.go` | +12/−1 | vehicle-name bookkeeping in `setActiveVehicle` |
+| `core/soc/estimator.go` | +8/−1 | two fields and their assignments |
+| `server/http.go` | +7 | route map entries — **the most likely conflict**, upstream adds routes here regularly |
+
+Everything else is in new files: `core/loadpoint_split.go`, `core/loadpoint_soc_estimate.go`,
+`core/soc/estimator_state.go`, `server/http_loadpoint_split_handler.go`,
+`server/http_loadpoint_soc_handler.go` and their tests.
+
+That split is deliberate. What remains in upstream files is what Go does not allow anywhere else —
+struct fields cannot be added from another file, route entries have to go in the route map, and three
+hooks sit inside existing functions. Everything that *could* move, has.
 
 ### 4. What `git rebase` cannot catch
 
