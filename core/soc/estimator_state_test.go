@@ -144,3 +144,20 @@ func TestRestoreWithRunningSessionEnergy(t *testing.T) {
 	source := 15.0
 	assert.Equal(t, 20.0, ce.Soc(&source, 800), "anchor is relative to the current counter")
 }
+
+func TestRestoreWithoutUsableGradientKeepsAnchor(t *testing.T) {
+	// a vehicle with 0 configured capacity makes the estimator's own
+	// gradient 0 too, so newTestEstimator (8.5 kWh) can't reproduce this case
+	ctrl := gomock.NewController(t)
+	vehicle := api.NewMockVehicle(ctrl)
+	vehicle.EXPECT().Capacity().Return(0.0).AnyTimes()
+
+	ce := NewEstimator(util.NewLogger("test"), api.NewMockCharger(ctrl), vehicle)
+
+	// neither the passed-in gradient nor the estimator's own is usable;
+	// without a guard, 500/0 would produce +Inf, and min(+Inf, 100) would
+	// silently clamp to a false 100% instead of surfacing the problem
+	ce.Restore(15, 500, 0, 0, true)
+
+	assert.Equal(t, 15.0, ce.State().VehicleSoc, "no usable gradient: seed the anchor instead of dividing by zero")
+}

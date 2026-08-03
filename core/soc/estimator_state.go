@@ -80,6 +80,13 @@ func (s *Estimator) ShiftEnergy(wh float64) error {
 // Setting prevSoc to the anchor is essential: a fresh estimator has prevSoc 0,
 // so the first poll would produce socDelta != 0, take the rebase branch and
 // discard everything restored here.
+//
+// If neither the passed-in energyPerSocStep nor the estimator's own gradient
+// is usable (both <= 0, e.g. a vehicle with 0 configured capacity), there is
+// no Wh/% to convert energySinceAnchor into an offset. Dividing by that zero
+// gradient would produce +/-Inf, which min(_, 100) silently clamps to a false
+// 100% instead of erroring — so in that case vehicleSoc is seeded with the
+// anchor alone, same as SetSoc refusing to touch a zero gradient.
 func (s *Estimator) Restore(anchorSoc, energySinceAnchor, energyPerSocStep, chargedEnergy float64, learned bool) {
 	if energyPerSocStep > 0 {
 		s.energyPerSocStep = energyPerSocStep
@@ -90,5 +97,10 @@ func (s *Estimator) Restore(anchorSoc, energySinceAnchor, energyPerSocStep, char
 	s.prevSoc = anchorSoc
 	s.fetchedSoc = anchorSoc
 	s.prevChargedEnergy = chargedEnergy - energySinceAnchor
-	s.vehicleSoc = min(anchorSoc+energySinceAnchor/s.energyPerSocStep, 100)
+
+	if s.energyPerSocStep > 0 {
+		s.vehicleSoc = min(anchorSoc+energySinceAnchor/s.energyPerSocStep, 100)
+	} else {
+		s.vehicleSoc = anchorSoc
+	}
 }
