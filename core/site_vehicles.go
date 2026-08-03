@@ -32,6 +32,17 @@ type vehicleStruct struct {
 	Plan           *planStruct         `json:"plan,omitempty"`
 	RepeatingPlans []api.RepeatingPlan `json:"repeatingPlans"`
 	PlanStrategy   api.PlanStrategy    `json:"planStrategy"`
+	SocEstimate    *socEstimateStruct  `json:"socEstimate,omitempty"`
+}
+
+// socEstimateStruct is the published view of a vehicle's soc estimate
+type socEstimateStruct struct {
+	Soc              float64   `json:"soc"`
+	AnchorSoc        float64   `json:"anchorSoc"`
+	Offset           float64   `json:"offset"`
+	EnergyPerSocStep float64   `json:"energyPerSocStep"`
+	Samples          int       `json:"samples"`
+	Updated          time.Time `json:"updated"`
 }
 
 // publishVehicles returns a list of vehicle titles
@@ -55,6 +66,18 @@ func (site *Site) publishVehicles() {
 			}
 		}
 
+		var socEstimate *socEstimateStruct
+		if se, ok := LoadSocEstimate(v.Name()); ok {
+			socEstimate = &socEstimateStruct{
+				Soc:              se.Soc(),
+				AnchorSoc:        se.AnchorSoc,
+				Offset:           se.Soc() - se.AnchorSoc,
+				EnergyPerSocStep: se.EnergyPerSocStep,
+				Samples:          se.Samples,
+				Updated:          se.Updated,
+			}
+		}
+
 		res[v.Name()] = vehicleStruct{
 			Title:          instance.GetTitle(),
 			Icon:           instance.Icon(),
@@ -70,6 +93,7 @@ func (site *Site) publishVehicles() {
 			Plan:           plan,
 			RepeatingPlans: v.GetRepeatingPlans(),
 			PlanStrategy:   v.GetPlanStrategy(),
+			SocEstimate:    socEstimate,
 		}
 
 		// publish effective plan strategy immediately for soc-based planning

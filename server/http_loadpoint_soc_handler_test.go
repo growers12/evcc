@@ -5,12 +5,15 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/evcc-io/evcc/core"
 	"github.com/evcc-io/evcc/core/loadpoint"
 	"github.com/evcc-io/evcc/core/soc"
+	"github.com/evcc-io/evcc/server/db/settings"
 	"github.com/gorilla/mux"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 )
 
@@ -110,6 +113,45 @@ func TestSocEstimateSetHandlerSuccess(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.Equal(t, 1, lp.setCalls)
 	assert.Equal(t, 0, lp.shiftCalls)
+}
+
+// TestVehicleSocEstimateHandlerNotFound covers the vehicle endpoint's 404,
+// which is distinct from the loadpoint endpoint's 409: 409 means "no
+// estimator is active on this loadpoint right now", 404 means "no record
+// exists for this vehicle name at all" - the case this endpoint exists for,
+// reading a persisted estimate for a vehicle that is not currently connected.
+func TestVehicleSocEstimateHandlerNotFound(t *testing.T) {
+	w := httptest.NewRecorder()
+	req := mux.SetURLVars(httptest.NewRequest(http.MethodGet, "/", nil), map[string]string{"name": "does-not-exist"})
+
+	// the site argument is unused by this handler - it reads straight from
+	// the persisted record via core.LoadSocEstimate - so nil is safe here
+	vehicleSocEstimateHandler(nil)(w, req)
+
+	assert.Equal(t, http.StatusNotFound, w.Code)
+}
+
+// TestVehicleSocEstimateHandlerReturnsRecord seeds a persisted record through
+// the real settings store (the same path saveSocEstimate writes through) and
+// checks the handler surfaces both the computed soc and the raw persisted
+// fields a dashboard needs.
+func TestVehicleSocEstimateHandlerReturnsRecord(t *testing.T) {
+	require.NoError(t, settings.SetJson("vehicle.test:http-vehicle.socEstimate", core.SocEstimate{
+		AnchorSoc:         15,
+		EnergySinceAnchor: 500,
+		EnergyPerSocStep:  100,
+		Samples:           2,
+		Updated:           time.Now(),
+	}))
+
+	w := httptest.NewRecorder()
+	req := mux.SetURLVars(httptest.NewRequest(http.MethodGet, "/", nil), map[string]string{"name": "test:http-vehicle"})
+
+	vehicleSocEstimateHandler(nil)(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"soc":20`)
+	assert.Contains(t, w.Body.String(), `"anchorSoc":15`)
 }
 
 func TestSocEstimateSetHandlerUnparseableValue(t *testing.T) {

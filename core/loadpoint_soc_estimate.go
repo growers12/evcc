@@ -131,6 +131,18 @@ func loadSocEstimate(name string) (SocEstimate, bool) {
 	return se, true
 }
 
+// LoadSocEstimate reads a vehicle's persisted estimate. Exported for the api
+// and the site's vehicle publisher, which need it for vehicles that are not
+// currently connected to any loadpoint.
+func LoadSocEstimate(name string) (SocEstimate, bool) {
+	return loadSocEstimate(name)
+}
+
+// Soc returns the estimate this record represents
+func (se SocEstimate) Soc() float64 {
+	return se.soc()
+}
+
 // saveSocEstimate writes a vehicle's estimate. The value only reaches SQLite
 // when evcc's own one-minute settings ticker flushes it.
 func saveSocEstimate(name string, se SocEstimate) error {

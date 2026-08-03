@@ -8,6 +8,7 @@ import (
 
 	"github.com/evcc-io/evcc/core"
 	"github.com/evcc-io/evcc/core/loadpoint"
+	"github.com/evcc-io/evcc/core/site"
 	"github.com/evcc-io/evcc/core/soc"
 	"github.com/gorilla/mux"
 )
@@ -120,5 +121,27 @@ func socEstimateClearHandler(lp loadpoint.API) http.HandlerFunc {
 		}
 
 		jsonWrite(w, true)
+	}
+}
+
+// vehicleSocEstimateHandler returns a vehicle's persisted estimate, also for
+// vehicles that are not currently connected
+func vehicleSocEstimateHandler(site site.API) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		name := mux.Vars(r)["name"]
+
+		se, ok := core.LoadSocEstimate(name)
+		if !ok {
+			jsonError(w, http.StatusNotFound, errors.New("no estimate for vehicle "+name))
+			return
+		}
+
+		jsonWrite(w, struct {
+			Soc float64 `json:"soc"`
+			core.SocEstimate
+		}{
+			Soc:         se.Soc(),
+			SocEstimate: se,
+		})
 	}
 }

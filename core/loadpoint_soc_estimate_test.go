@@ -549,3 +549,12 @@ func TestRestoreSocEstimateDropsExpiredOffset(t *testing.T) {
 	assert.Equal(t, 15.0, st.VehicleSoc, "offset discarded: vehicle soc falls back to the anchor")
 	assert.Equal(t, 100.0, st.EnergyPerSocStep, "gradient survives even when the offset is discarded")
 }
+
+func TestLoadSocEstimateExported(t *testing.T) {
+	se := SocEstimate{AnchorSoc: 15, EnergySinceAnchor: 500, EnergyPerSocStep: 100, Updated: time.Now()}
+	require.NoError(t, saveSocEstimate("test:9", se))
+
+	got, ok := LoadSocEstimate("test:9")
+	require.True(t, ok)
+	assert.InDelta(t, 20.0, got.Soc(), 0.01)
+}
