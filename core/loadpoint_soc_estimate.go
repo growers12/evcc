@@ -7,6 +7,7 @@ import (
 
 	"github.com/evcc-io/evcc/api"
 	"github.com/evcc-io/evcc/core/soc"
+	"github.com/evcc-io/evcc/core/vehicle"
 	"github.com/evcc-io/evcc/server/db/settings"
 )
 
@@ -217,6 +218,7 @@ func (lp *Loadpoint) updateSocEstimate(estimator *soc.Estimator, vehicleName str
 	}
 
 	se, _ := loadSocEstimate(vehicleName)
+	before := se
 
 	// the estimator rebases prevSoc whenever the source reports a changed
 	// value; that is the moment the blind phase ends and learning is possible
@@ -264,6 +266,24 @@ func (lp *Loadpoint) updateSocEstimate(estimator *soc.Estimator, vehicleName str
 
 	if err := saveSocEstimate(vehicleName, se); err != nil {
 		lp.log.ERROR.Printf("soc estimate: %v", err)
+		return
+	}
+
+	// publishVehicles only runs on vehicle *setting* changes, so without this
+	// the published record freezes between them and the dashboard shows a
+	// gradient the estimator stopped using hours ago.
+	//
+	// Deliberately not on every call: EnergySinceAnchor grows with each poll,
+	// and republishing the whole vehicle map that often would be noise. The
+	// live estimate is already published continuously as loadpoints/N/vehicleSoc
+	// - what needs to reach the dashboard here are the three values that change
+	// rarely and say whether the estimate can be trusted.
+	if se.AnchorSoc != before.AnchorSoc ||
+		se.EnergyPerSocStep != before.EnergyPerSocStep ||
+		se.Samples != before.Samples {
+		if vehicle.Publish != nil {
+			vehicle.Publish()
+		}
 	}
 }
 
