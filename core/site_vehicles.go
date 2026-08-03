@@ -35,13 +35,17 @@ type vehicleStruct struct {
 	SocEstimate    *socEstimateStruct  `json:"socEstimate,omitempty"`
 }
 
-// socEstimateStruct is the published view of a vehicle's soc estimate
+// socEstimateStruct is the published view of a vehicle's soc estimate.
+// AnchorUpdated is what tells the operator how much of the number is still
+// measurement and how much is extrapolation - Updated is only the write
+// timestamp and would always read "just now".
 type socEstimateStruct struct {
 	Soc              float64   `json:"soc"`
 	AnchorSoc        float64   `json:"anchorSoc"`
 	Offset           float64   `json:"offset"`
 	EnergyPerSocStep float64   `json:"energyPerSocStep"`
 	Samples          int       `json:"samples"`
+	AnchorUpdated    time.Time `json:"anchorUpdated"`
 	Updated          time.Time `json:"updated"`
 }
 
@@ -74,6 +78,7 @@ func (site *Site) publishVehicles() {
 				Offset:           se.Soc() - se.AnchorSoc,
 				EnergyPerSocStep: se.EnergyPerSocStep,
 				Samples:          se.Samples,
+				AnchorUpdated:    se.AnchorUpdated,
 				Updated:          se.Updated,
 			}
 		}

@@ -152,10 +152,13 @@ func (lp *Loadpoint) setActiveVehicle(v api.Vehicle) {
 		if v.Capacity() > 0 && (lp.Soc.Estimate == nil || *lp.Soc.Estimate) {
 			lp.socEstimator = soc.NewEstimator(lp.log, lp.charger, v)
 			lp.socEstimateVehicle = vehicleName
-			if prev != v {
-				lp.socEstimateOdometer = 0
-			}
 			lp.restoreSocEstimate()
+		} else {
+			// this vehicle gets no estimate. Leaving the previous car's
+			// estimator in place would book this car's energy onto that car's
+			// record - plausible numbers, wrong vehicle.
+			lp.socEstimator = nil
+			lp.socEstimateVehicle = ""
 		}
 
 		lp.publish(keys.VehicleName, vehicleName)
@@ -176,7 +179,6 @@ func (lp *Loadpoint) setActiveVehicle(v api.Vehicle) {
 	} else {
 		lp.socEstimator = nil
 		lp.socEstimateVehicle = ""
-		lp.socEstimateOdometer = 0
 		lp.unpublishVehicleIdentity()
 	}
 
@@ -332,7 +334,6 @@ func (lp *Loadpoint) vehicleOdometer() {
 		if odo, err := vs.Odometer(); err == nil {
 			lp.log.DEBUG.Printf("vehicle odometer: %.0fkm", odo)
 			lp.publish(keys.VehicleOdometer, odo)
-			lp.socEstimateOdometer = odo
 
 			// update session once odometer is read
 			lp.updateSession(func(session *session.Session) {

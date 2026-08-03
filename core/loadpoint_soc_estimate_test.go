@@ -1,6 +1,7 @@
 package core
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -15,6 +16,19 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 )
+
+// odometerVehicle decorates a mock vehicle with api.VehicleOdometer, which the
+// generated mock does not implement. The reading comes from a closure so a
+// test can move the car between polls, and return an error to model the read
+// failing at the learning moment.
+type odometerVehicle struct {
+	api.Vehicle
+	odo func() (float64, error)
+}
+
+func (v *odometerVehicle) Odometer() (float64, error) {
+	return v.odo()
+}
 
 func TestSocEstimateSoc(t *testing.T) {
 	se := SocEstimate{AnchorSoc: 15, EnergySinceAnchor: 4823.5, EnergyPerSocStep: 964.7}
@@ -48,6 +62,21 @@ func TestSocEstimatePlausible(t *testing.T) {
 			"no gradient",
 			SocEstimate{AnchorSoc: 15, EnergySinceAnchor: 4823, EnergyPerSocStep: 0, Updated: now.Add(-time.Hour)},
 			false,
+		},
+		{
+			// soc() clamps at 100, so an anchor of 60 with a 200 point offset
+			// would report as a harmless 40 and pass the check
+			"offset beyond 50 points, hidden by the display clamp",
+			SocEstimate{AnchorSoc: 60, EnergySinceAnchor: 192940, EnergyPerSocStep: 964.7, Updated: now.Add(-time.Hour)},
+			false,
+		},
+		{
+			// the age guard is about evcc not running, not about the car being
+			// quiet: a car parked without network keeps its anchor for days,
+			// which is the whole reason this feature exists
+			"old anchor, record still attended",
+			SocEstimate{AnchorSoc: 15, EnergySinceAnchor: 4823, EnergyPerSocStep: 964.7, AnchorUpdated: now.Add(-72 * time.Hour), Updated: now.Add(-time.Minute)},
+			true,
 		},
 	}
 
@@ -91,7 +120,7 @@ func TestUpdateSocEstimateTracksAnchor(t *testing.T) {
 
 	source := 15.0
 	lp.socEstimator.Soc(&source, 0)
-	lp.updateSocEstimate(lp.socEstimator)
+	lp.updateSocEstimate(lp.socEstimator, lp.socEstimateVehicle, vehicle)
 
 	se, ok := loadSocEstimate("test:2")
 	require.True(t, ok)
@@ -100,7 +129,7 @@ func TestUpdateSocEstimateTracksAnchor(t *testing.T) {
 
 	// 300 Wh into the session, source still frozen
 	lp.socEstimator.Soc(&source, 300)
-	lp.updateSocEstimate(lp.socEstimator)
+	lp.updateSocEstimate(lp.socEstimator, lp.socEstimateVehicle, vehicle)
 
 	se, _ = loadSocEstimate("test:2")
 	assert.Equal(t, 15.0, se.AnchorSoc, "anchor stays put while the source is frozen")
@@ -120,14 +149,14 @@ func TestUpdateSocEstimateAccumulatesAcrossSessions(t *testing.T) {
 	source := 15.0
 	lp.socEstimator.Soc(&source, 0)
 	lp.socEstimator.Soc(&source, 300)
-	lp.updateSocEstimate(lp.socEstimator)
+	lp.updateSocEstimate(lp.socEstimator, lp.socEstimateVehicle, vehicle)
 
 	// unplug and replug: fresh estimator, session counter back to zero
 	lp.socEstimator = soc.NewEstimator(lp.log, api.NewMockCharger(ctrl), vehicle)
 	lp.restoreSocEstimate()
 	lp.socEstimator.Soc(&source, 0)
 	lp.socEstimator.Soc(&source, 200)
-	lp.updateSocEstimate(lp.socEstimator)
+	lp.updateSocEstimate(lp.socEstimator, lp.socEstimateVehicle, vehicle)
 
 	se, _ := loadSocEstimate("test:3")
 	assert.Equal(t, 500.0, se.EnergySinceAnchor, "energy accumulates across the session boundary")
@@ -161,50 +190,73 @@ func TestLearnGradient(t *testing.T) {
 	const capacity = 8.5
 
 	tc := []struct {
-		name     string
-		se       SocEstimate
-		newSoc   float64
-		odometer float64
-		learned  bool
-		expected float64
+		name          string
+		se            SocEstimate
+		newSoc        float64
+		odometer      float64
+		odometerKnown bool
+		learned       bool
+		expected      float64
+		expectedOdo   float64
 	}{
 		{
 			"clean 40 point rise",
 			SocEstimate{AnchorSoc: 15, EnergySinceAnchor: 4800, EnergyPerSocStep: 100, OdometerAtAnchor: 28011},
-			55, 28013, true,
+			55, 28013, true, true,
 			// measured 4800/40 = 120, EMA 0.7*100 + 0.3*120 = 106
-			106,
+			106, 28013,
 		},
 		{
 			"rise too small",
 			SocEstimate{AnchorSoc: 15, EnergySinceAnchor: 800, EnergyPerSocStep: 100, OdometerAtAnchor: 28011},
-			23, 28013, false, 100,
+			23, 28013, true, false, 100, 28013,
+		},
+		{
+			// the spec's rule is a rise of *more* than 10 points
+			"rise exactly at the limit",
+			SocEstimate{AnchorSoc: 15, EnergySinceAnchor: 1000, EnergyPerSocStep: 100, OdometerAtAnchor: 28011},
+			25, 28013, true, false, 100, 28013,
 		},
 		{
 			"no energy since anchor",
 			SocEstimate{AnchorSoc: 15, EnergySinceAnchor: 0, EnergyPerSocStep: 100, OdometerAtAnchor: 28011},
-			55, 28013, false, 100,
+			55, 28013, true, false, 100, 28013,
 		},
 		{
 			"drove too far before reporting",
 			SocEstimate{AnchorSoc: 15, EnergySinceAnchor: 4800, EnergyPerSocStep: 100, OdometerAtAnchor: 28011},
-			55, 28040, false, 100,
+			55, 28040, true, false, 100, 28040,
+		},
+		{
+			// without a current reading the drive cannot be bounded at all,
+			// and the odometer anchor stays where it was rather than being
+			// zeroed - a zero would disable the guard on the next cycle
+			"odometer could not be read",
+			SocEstimate{AnchorSoc: 15, EnergySinceAnchor: 4800, EnergyPerSocStep: 100, OdometerAtAnchor: 28011},
+			55, 0, false, false, 100, 28011,
+		},
+		{
+			// a vehicle without an odometer reports 0 with a known reading,
+			// which leaves the distance guard disabled as before
+			"vehicle has no odometer",
+			SocEstimate{AnchorSoc: 15, EnergySinceAnchor: 4800, EnergyPerSocStep: 100},
+			55, 0, true, true, 106, 0,
 		},
 		{
 			"result beyond twice nominal",
 			SocEstimate{AnchorSoc: 15, EnergySinceAnchor: 40000, EnergyPerSocStep: 100, OdometerAtAnchor: 28011},
-			55, 28013, false, 100,
+			55, 28013, true, false, 100, 28013,
 		},
 		{
 			"soc dropped",
 			SocEstimate{AnchorSoc: 55, EnergySinceAnchor: 4800, EnergyPerSocStep: 100, OdometerAtAnchor: 28011},
-			15, 28013, false, 100,
+			15, 28013, true, false, 100, 28013,
 		},
 	}
 
 	for _, tc := range tc {
 		t.Run(tc.name, func(t *testing.T) {
-			got, learned := tc.se.learn(tc.newSoc, tc.odometer, capacity)
+			got, learned := tc.se.learn(tc.newSoc, tc.odometer, tc.odometerKnown, capacity)
 
 			assert.Equal(t, tc.learned, learned)
 			assert.InDelta(t, tc.expected, got.EnergyPerSocStep, 0.01)
@@ -213,7 +265,7 @@ func TestLearnGradient(t *testing.T) {
 			// would block the record forever
 			assert.Equal(t, tc.newSoc, got.AnchorSoc)
 			assert.Equal(t, 0.0, got.EnergySinceAnchor)
-			assert.Equal(t, tc.odometer, got.OdometerAtAnchor)
+			assert.Equal(t, tc.expectedOdo, got.OdometerAtAnchor)
 		})
 	}
 }
@@ -221,7 +273,7 @@ func TestLearnGradient(t *testing.T) {
 func TestLearnCountsSamples(t *testing.T) {
 	se := SocEstimate{AnchorSoc: 15, EnergySinceAnchor: 4800, EnergyPerSocStep: 100, OdometerAtAnchor: 28011, Samples: 2}
 
-	got, learned := se.learn(55, 28013, 8.5)
+	got, learned := se.learn(55, 28013, true, 8.5)
 	assert.True(t, learned)
 	assert.Equal(t, 3, got.Samples)
 }
@@ -232,32 +284,32 @@ func TestLearnCountsSamples(t *testing.T) {
 // it keeps holding on later polls rather than being clobbered one cycle
 // later by the estimator's own (still-stale) gradient — see production's
 // call pattern in publishSocAndRange: socEstimator.Soc(socR,
-// lp.GetChargedEnergy()) followed by lp.updateSocEstimate(socEstimator),
-// both reading the same lp.GetChargedEnergy(). The test drives
-// lp.energyMetrics directly (rather than passing ad-hoc numbers to Soc)
-// so that coupling is real, not assumed.
+// lp.GetChargedEnergy()) followed by lp.updateSocEstimate(...), both reading
+// the same lp.GetChargedEnergy(). The test drives lp.energyMetrics directly
+// (rather than passing ad-hoc numbers to Soc) so that coupling is real, not
+// assumed, and it moves the odometer between the two sessions because the
+// distance guard is evaluated against a reading taken at the learning moment.
 func TestUpdateSocEstimateLearnsAcrossSessionBoundary(t *testing.T) {
 	lp := NewLoadpoint(util.NewLogger("test"), coresettings.NewDatabaseSettingsAdapter("test."))
 
 	ctrl := gomock.NewController(t)
-	vehicle := api.NewMockVehicle(ctrl)
-	vehicle.EXPECT().Capacity().Return(8.5).AnyTimes()
-	lp.vehicle = vehicle // vehicleCapacity() reads the active vehicle via GetVehicle()
+	odo := 28011.0
+	vehicle := &odometerVehicle{Vehicle: api.NewMockVehicle(ctrl), odo: func() (float64, error) { return odo, nil }}
+	vehicle.Vehicle.(*api.MockVehicle).EXPECT().Capacity().Return(8.5).AnyTimes()
 	lp.socEstimateVehicle = "test:6"
-	lp.socEstimateOdometer = 28011
 
 	// session 1: anchor at 15%, source frozen, 4800 Wh delivered
 	lp.socEstimator = soc.NewEstimator(lp.log, api.NewMockCharger(ctrl), vehicle)
 	source := 15.0
 	lp.socEstimator.Soc(&source, lp.GetChargedEnergy())
-	lp.updateSocEstimate(lp.socEstimator)
+	lp.updateSocEstimate(lp.socEstimator, lp.socEstimateVehicle, vehicle)
 	lp.energyMetrics.Update(4.8) // 4800 Wh
 	lp.socEstimator.Soc(&source, lp.GetChargedEnergy())
-	lp.updateSocEstimate(lp.socEstimator)
+	lp.updateSocEstimate(lp.socEstimator, lp.socEstimateVehicle, vehicle)
 
 	// unplug, drive 2km (within the guard), replug: fresh estimator and fresh
 	// session energy counter, restore folds the persisted anchor back in
-	lp.socEstimateOdometer = 28013
+	odo = 28013
 	lp.energyMetrics.Reset()
 	lp.socEstimator = soc.NewEstimator(lp.log, api.NewMockCharger(ctrl), vehicle)
 	lp.restoreSocEstimate()
@@ -265,13 +317,19 @@ func TestUpdateSocEstimateLearnsAcrossSessionBoundary(t *testing.T) {
 	// the car finally reports the real value: a clean 40 point rise
 	source = 55.0
 	lp.socEstimator.Soc(&source, lp.GetChargedEnergy())
-	lp.updateSocEstimate(lp.socEstimator)
+	lp.updateSocEstimate(lp.socEstimator, lp.socEstimateVehicle, vehicle)
 
 	se, ok := loadSocEstimate("test:6")
 	require.True(t, ok)
 	// measured 4800/40 = 120, EMA 0.7*100 + 0.3*120 = 106
 	assert.InDelta(t, 106.0, se.EnergyPerSocStep, 0.01, "learned gradient must survive the persisted record")
 	assert.Equal(t, 1, se.Samples)
+	assert.Equal(t, 28013.0, se.OdometerAtAnchor, "the anchor carries the reading taken at the learning moment")
+	assert.False(t, se.AnchorUpdated.IsZero(), "the anchor timestamp is set when the anchor moves")
+
+	// pushing the learned gradient into the live estimator must not move the
+	// estimate itself: the estimator has just rebased onto 55%
+	assert.InDelta(t, 55.0, lp.socEstimator.State().VehicleSoc, 0.01, "the learn push must not disturb the estimate")
 
 	// two more polls after the learning call: the source stays caught up at
 	// 55% while more energy is delivered. Both the persisted record and the
@@ -279,11 +337,11 @@ func TestUpdateSocEstimateLearnsAcrossSessionBoundary(t *testing.T) {
 	// pre-learn value.
 	lp.energyMetrics.Update(0.05) // +50 Wh
 	lp.socEstimator.Soc(&source, lp.GetChargedEnergy())
-	lp.updateSocEstimate(lp.socEstimator)
+	lp.updateSocEstimate(lp.socEstimator, lp.socEstimateVehicle, vehicle)
 
 	lp.energyMetrics.Update(0.10) // +50 Wh more
 	lp.socEstimator.Soc(&source, lp.GetChargedEnergy())
-	lp.updateSocEstimate(lp.socEstimator)
+	lp.updateSocEstimate(lp.socEstimator, lp.socEstimateVehicle, vehicle)
 
 	se, ok = loadSocEstimate("test:6")
 	require.True(t, ok)
@@ -345,7 +403,7 @@ func TestShiftSocEstimateQueuesTask(t *testing.T) {
 	lp.socEstimator = soc.NewEstimator(lp.log, api.NewMockCharger(ctrl), vehicle)
 
 	require.NoError(t, lp.ShiftSocEstimate(1.5))
-	require.NoError(t, lp.ShiftSocEstimate(-2.0))
+	require.NoError(t, lp.ShiftSocEstimate(2.0))
 
 	assert.Equal(t, 2, lp.tasks.Size(), "second call must not be deduplicated away")
 }
@@ -625,7 +683,7 @@ func TestRestoreSocEstimateSurvivesSessionCounterReset(t *testing.T) {
 	got := lp.socEstimator.Soc(&source, lp.GetChargedEnergy())
 	assert.InDelta(t, 22.05, got, 0.01, "the restored estimate must survive the session counter reset")
 
-	lp.updateSocEstimate(lp.socEstimator)
+	lp.updateSocEstimate(lp.socEstimator, lp.socEstimateVehicle, vehicle)
 
 	se, ok := loadSocEstimate("test:counterreset")
 	require.True(t, ok)
@@ -639,4 +697,161 @@ func TestLoadSocEstimateExported(t *testing.T) {
 	got, ok := LoadSocEstimate("test:9")
 	require.True(t, ok)
 	assert.InDelta(t, 20.0, got.Soc(), 0.01)
+}
+
+// TestUpdateSocEstimateSkipsLearnWithoutOdometer covers the learning moment
+// where the vehicle is known to have an odometer but the read fails. Learning
+// blind is the dangerous option here: an unnoticed long drive inflates the
+// measured gradient by tens of percent, lands inside the sanity band and is
+// accepted, after which every estimate reads low and minSoc pulls grid power.
+func TestUpdateSocEstimateSkipsLearnWithoutOdometer(t *testing.T) {
+	lp := NewLoadpoint(util.NewLogger("test"), coresettings.NewDatabaseSettingsAdapter("test."))
+
+	ctrl := gomock.NewController(t)
+	readable := true
+	vehicle := &odometerVehicle{Vehicle: api.NewMockVehicle(ctrl), odo: func() (float64, error) {
+		if !readable {
+			return 0, errors.New("vehicle offline")
+		}
+		return 28011, nil
+	}}
+	vehicle.Vehicle.(*api.MockVehicle).EXPECT().Capacity().Return(8.5).AnyTimes()
+	lp.socEstimateVehicle = "test:noodo"
+
+	lp.socEstimator = soc.NewEstimator(lp.log, api.NewMockCharger(ctrl), vehicle)
+	source := 15.0
+	lp.socEstimator.Soc(&source, lp.GetChargedEnergy())
+	lp.updateSocEstimate(lp.socEstimator, lp.socEstimateVehicle, vehicle)
+
+	lp.energyMetrics.Update(4.8)
+	lp.socEstimator.Soc(&source, lp.GetChargedEnergy())
+	lp.updateSocEstimate(lp.socEstimator, lp.socEstimateVehicle, vehicle)
+
+	se, ok := loadSocEstimate("test:noodo")
+	require.True(t, ok)
+	require.Equal(t, 28011.0, se.OdometerAtAnchor)
+
+	// unplug and replug, so the estimator's own in-session learner (which needs
+	// the car to report a rising soc while charging) stays out of this
+	lp.energyMetrics.Reset()
+	lp.socEstimator = soc.NewEstimator(lp.log, api.NewMockCharger(ctrl), vehicle)
+	lp.restoreSocEstimate()
+
+	// the car reports a clean 40 point rise, but its odometer is unreachable
+	readable = false
+	source = 55.0
+	lp.socEstimator.Soc(&source, lp.GetChargedEnergy())
+	lp.updateSocEstimate(lp.socEstimator, lp.socEstimateVehicle, vehicle)
+
+	se, ok = loadSocEstimate("test:noodo")
+	require.True(t, ok)
+	assert.Equal(t, 100.0, se.EnergyPerSocStep, "the gradient must not be learned from an unbounded drive")
+	assert.Equal(t, 0, se.Samples)
+	assert.Equal(t, 55.0, se.AnchorSoc, "the anchor still moves, or the record would be stuck forever")
+	assert.Equal(t, 28011.0, se.OdometerAtAnchor, "the last known reading is kept, which only makes the next check stricter")
+}
+
+// TestUpdateSocEstimateKeepsEnergyAboveFullBattery covers the 100% clamp in
+// soc.Estimator.Soc: derived from the soc difference, EnergySinceAnchor would
+// stop growing there and quietly drop every further kWh from the record - and
+// from the next learn's input.
+func TestUpdateSocEstimateKeepsEnergyAboveFullBattery(t *testing.T) {
+	lp := NewLoadpoint(util.NewLogger("test"), coresettings.NewDatabaseSettingsAdapter("test."))
+
+	ctrl := gomock.NewController(t)
+	vehicle := api.NewMockVehicle(ctrl)
+	vehicle.EXPECT().Capacity().Return(8.5).AnyTimes()
+	lp.socEstimateVehicle = "test:clamp"
+
+	lp.socEstimator = soc.NewEstimator(lp.log, api.NewMockCharger(ctrl), vehicle)
+	source := 90.0
+	lp.socEstimator.Soc(&source, 0)
+
+	// 3000 Wh at 100 Wh/% is 30 points on top of 90: the estimate saturates
+	lp.socEstimator.Soc(&source, 3000)
+	lp.updateSocEstimate(lp.socEstimator, lp.socEstimateVehicle, vehicle)
+
+	se, ok := loadSocEstimate("test:clamp")
+	require.True(t, ok)
+	assert.Equal(t, 100.0, lp.socEstimator.State().VehicleSoc, "the estimate itself is clamped, as before")
+	assert.Equal(t, 3000.0, se.EnergySinceAnchor, "the recorded energy is not")
+}
+
+// TestSetSocEstimateRejectsBelowSource is the loadpoint half of the estimator
+// guard: the check has to happen synchronously, because the queued task runs
+// after the http response has already gone out as a 200.
+func TestSetSocEstimateRejectsBelowSource(t *testing.T) {
+	lp := NewLoadpoint(util.NewLogger("test"), coresettings.NewDatabaseSettingsAdapter("test."))
+
+	ctrl := gomock.NewController(t)
+	vehicle := api.NewMockVehicle(ctrl)
+	vehicle.EXPECT().Capacity().Return(8.5).AnyTimes()
+	lp.socEstimator = soc.NewEstimator(lp.log, api.NewMockCharger(ctrl), vehicle)
+
+	source := 40.0
+	lp.socEstimator.Soc(&source, 0)
+
+	assert.Error(t, lp.SetSocEstimate(30), "below the vehicle's own value")
+	assert.Error(t, lp.ShiftSocEstimate(-1.0), "same by way of the energy endpoint")
+	assert.Equal(t, 0, lp.tasks.Size(), "a rejected target must never reach the task queue")
+
+	require.NoError(t, lp.SetSocEstimate(45))
+	assert.Equal(t, 1, lp.tasks.Size())
+}
+
+// TestClearSocEstimateResetsTheOverride covers the half of DELETE /soc that
+// the operator actually notices. Dropping the persisted record on its own
+// changes nothing: the override lives in the running estimator's energy
+// anchor, and the next poll re-anchors and writes an identical record back.
+func TestClearSocEstimateResetsTheOverride(t *testing.T) {
+	lp := NewLoadpoint(util.NewLogger("test"), coresettings.NewDatabaseSettingsAdapter("test."))
+	lp.socEstimateVehicle = "test:clear2"
+
+	ctrl := gomock.NewController(t)
+	vehicle := api.NewMockVehicle(ctrl)
+	vehicle.EXPECT().Capacity().Return(8.5).AnyTimes()
+	lp.socEstimator = soc.NewEstimator(lp.log, api.NewMockCharger(ctrl), vehicle)
+
+	source := 15.0
+	lp.socEstimator.Soc(&source, 0)
+	require.NoError(t, lp.socEstimator.SetSoc(30))
+
+	require.NoError(t, lp.ClearSocEstimate())
+
+	task, ok := lp.tasks.Dequeue()
+	require.True(t, ok)
+	task()
+
+	assert.Equal(t, 15.0, lp.socEstimator.State().VehicleSoc, "the estimate follows the vehicle again")
+	assert.Equal(t, 15.0, lp.socEstimator.Soc(&source, 0), "and keeps doing so on the next poll")
+}
+
+// TestSetActiveVehicleWithoutEstimateClearsEstimator covers the vehicle swap
+// where the new car gets no estimator (no capacity, or estimate: false).
+// Leaving the previous car's estimator and record name in place would book
+// this car's energy onto the other car's record.
+func TestSetActiveVehicleWithoutEstimateClearsEstimator(t *testing.T) {
+	ctrl := gomock.NewController(t)
+
+	lp := NewLoadpoint(util.NewLogger("test"), coresettings.NewDatabaseSettingsAdapter("test."))
+	x, y, z := createChannels(t)
+	attachChannels(lp, x, y, z)
+
+	prev := api.NewMockVehicle(ctrl)
+	prev.EXPECT().Capacity().Return(8.5).AnyTimes()
+	lp.socEstimator = soc.NewEstimator(lp.log, api.NewMockCharger(ctrl), prev)
+	lp.socEstimateVehicle = "test:previous"
+
+	// a vehicle without a configured capacity cannot be estimated
+	next := api.NewMockVehicle(ctrl)
+	next.EXPECT().GetTitle().Return("guest").AnyTimes()
+	next.EXPECT().Icon().Return("").AnyTimes()
+	next.EXPECT().Capacity().Return(0.0).AnyTimes()
+	next.EXPECT().Phases().AnyTimes()
+	next.EXPECT().OnIdentified().AnyTimes()
+
+	lp.setActiveVehicle(next)
+
+	assert.Nil(t, lp.socEstimator, "the previous car's estimator must not survive the swap")
+	assert.Empty(t, lp.socEstimateVehicle, "and neither must its record name")
 }

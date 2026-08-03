@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/evcc-io/evcc/api"
 	"github.com/evcc-io/evcc/core/soc"
 	"github.com/evcc-io/evcc/server/db/settings"
 )
@@ -14,7 +15,17 @@ const (
 	// vehicle.<name>.<key> scheme evcc already uses for minSoc and limitSoc
 	socEstimateKey = "socEstimate"
 
-	// socEstimateMaxAge discards a record whose anchor is too old to trust
+	// socEstimateMaxAge is how long a record may go unattended before its
+	// offset is dropped. It is measured against Updated, the write timestamp,
+	// because that is what an unattended record means here: while evcc runs,
+	// every poll re-derives EnergySinceAnchor from the charger's own counter,
+	// so the offset cannot drift. Only evcc not running can make it wrong -
+	// the car may have been driven and charged elsewhere meanwhile.
+	//
+	// Explicitly *not* measured against AnchorUpdated: a car parked in a
+	// garage without network is expected to sit on the same anchor for days,
+	// which is the entire reason this feature exists. Discarding its offset on
+	// a restart would recreate the incident the feature prevents.
 	socEstimateMaxAge = 24 * time.Hour
 
 	// socEstimateMaxOffset caps a restored offset, in percentage points
@@ -44,10 +55,11 @@ type SocEstimate struct {
 	EnergyPerSocStep  float64   `json:"energyPerSocStep"`  // Wh per soc percentage point
 	Samples           int       `json:"samples"`           // number of completed learning cycles
 	OdometerAtAnchor  float64   `json:"odometerAtAnchor"`  // km reading when the anchor was set
-	Updated           time.Time `json:"updated"`
+	AnchorUpdated     time.Time `json:"anchorUpdated"`     // when the vehicle last reported a changed soc
+	Updated           time.Time `json:"updated"`           // when this record was last written
 }
 
-// soc returns the estimate this record represents
+// soc returns the estimate this record represents, clamped to 100% for display
 func (se SocEstimate) soc() float64 {
 	if se.EnergyPerSocStep <= 0 {
 		return se.AnchorSoc
@@ -55,9 +67,15 @@ func (se SocEstimate) soc() float64 {
 	return min(se.AnchorSoc+se.EnergySinceAnchor/se.EnergyPerSocStep, 100)
 }
 
-// offset returns the estimate's distance above the anchor, in percentage points
+// offset returns the estimate's distance above the anchor, in percentage
+// points. Deliberately derived from the energy rather than from soc(): the
+// clamp in there would report an anchor of 60 with a 200 point offset as a
+// harmless 40 and let it pass the plausibility check.
 func (se SocEstimate) offset() float64 {
-	return se.soc() - se.AnchorSoc
+	if se.EnergyPerSocStep <= 0 {
+		return 0
+	}
+	return se.EnergySinceAnchor / se.EnergyPerSocStep
 }
 
 // plausible reports whether the record's offset may be restored. The gradient
@@ -81,13 +99,32 @@ func (se SocEstimate) plausible(now time.Time) bool {
 	}
 }
 
+// learnable reports whether a re-anchor onto newSoc could produce a usable
+// gradient measurement at all. Used as a pre-filter so that the odometer is
+// only read when it can actually decide something - the source changing by a
+// point or two is a re-anchor like any other and happens far more often than
+// a real learning moment.
+func (se SocEstimate) learnable(newSoc float64) bool {
+	return newSoc-se.AnchorSoc > socLearnMinRise && se.EnergySinceAnchor > 0
+}
+
 // learn folds a fresh vehicle reading into the gradient and re-anchors the
 // record. The bool reports whether the gradient was actually updated.
 //
+// odometerKnown false means the current reading could not be established, not
+// that the car has no odometer (a car without one reports 0 with
+// odometerKnown true, which disables the distance guard as before). Without a
+// current reading the drive since the anchor cannot be bounded, so the
+// gradient is left alone: an unnoticed 60 km drive inflates the measurement by
+// about half, lands inside the sanity band and would be accepted.
+//
 // The anchor is re-set even when learning is rejected. Otherwise a single
 // missed learning moment — a long drive before the car reports — would leave
-// EnergySinceAnchor growing against a stale anchor forever.
-func (se SocEstimate) learn(newSoc, odometer, capacity float64) (SocEstimate, bool) {
+// EnergySinceAnchor growing against a stale anchor forever. OdometerAtAnchor
+// on the other hand is only advanced on a fresh reading: keeping the older one
+// makes the next distance check span more kilometres than it should, which can
+// only reject a learn, never wave a bad one through.
+func (se SocEstimate) learn(newSoc float64, odometer float64, odometerKnown bool, capacity float64) (SocEstimate, bool) {
 	rise := newSoc - se.AnchorSoc
 	distance := odometer - se.OdometerAtAnchor
 	nominal := capacity * 1e3 / soc.ChargeEfficiency / 100
@@ -95,8 +132,8 @@ func (se SocEstimate) learn(newSoc, odometer, capacity float64) (SocEstimate, bo
 	learned := false
 
 	switch {
-	case rise < socLearnMinRise:
-	case se.EnergySinceAnchor <= 0:
+	case !se.learnable(newSoc):
+	case !odometerKnown:
 	case odometer > 0 && se.OdometerAtAnchor > 0 && distance > socLearnMaxDistance:
 	default:
 		// energySinceAnchor is measured at the charger, so the learned value
@@ -113,9 +150,37 @@ func (se SocEstimate) learn(newSoc, odometer, capacity float64) (SocEstimate, bo
 
 	se.AnchorSoc = newSoc
 	se.EnergySinceAnchor = 0
-	se.OdometerAtAnchor = odometer
+
+	if odometerKnown && odometer > 0 {
+		se.OdometerAtAnchor = odometer
+	}
 
 	return se, learned
+}
+
+// vehicleOdometerNow reads the vehicle's odometer at the moment it is needed.
+//
+// lp.socEstimateOdometer used to stand in for this, but it is only written at
+// vehicle connect and disconnect, while the learning moment is the poll after
+// the car has left the garage and regained coverage - so the distance measured
+// was always ~0 and the guard never fired.
+//
+// The second return value distinguishes "no reading" from "no odometer": a
+// vehicle without the capability reports (0, true), which leaves the distance
+// guard disabled exactly as before, while a failed read reports (0, false) and
+// suppresses learning.
+func vehicleOdometerNow(v api.Vehicle) (float64, bool) {
+	vs, ok := api.Cap[api.VehicleOdometer](v)
+	if !ok {
+		return 0, true
+	}
+
+	odo, err := vs.Odometer()
+	if err != nil {
+		return 0, false
+	}
+
+	return odo, true
 }
 
 func socEstimateSettingsKey(name string) string {
@@ -156,19 +221,22 @@ func deleteSocEstimate(name string) error {
 
 // updateSocEstimate mirrors the running estimator into the persisted record.
 //
-// estimator is the caller's already-snapshotted copy of lp.socEstimator (see
-// the race-condition guard in publishSocAndRange, evcc issue 16180) — reading
-// lp.socEstimator or lp.socEstimateVehicle again here could tear an
-// (estimator, vehicle name) pair apart if setActiveVehicle runs concurrently.
+// estimator, vehicleName and v are the caller's snapshot of lp.socEstimator,
+// lp.socEstimateVehicle and the active vehicle. They are passed in rather than
+// read from lp because setActiveVehicle runs synchronously on the http and
+// mqtt goroutines: re-reading any of them here could pair car A's estimator
+// with car B's name and write A's energy into B's record - both records
+// staying syntactically valid, which is why the tearing would go unnoticed.
+// The same reason upstream snapshots socEstimator in publishSocAndRange, see
+// evcc issue 16180.
 //
 // There is no separate cross-session bookkeeping here: the estimator is
 // rebuilt from scratch on every vehicle connect (setActiveVehicle), and
 // restoreSocEstimate's call to Restore() folds the persisted energySinceAnchor
 // back into the fresh estimator's prevChargedEnergy. That means the running
-// estimator's own (VehicleSoc-PrevSoc)*EnergyPerSocStep already carries the
-// full history since the anchor — this function just reads it back out.
-func (lp *Loadpoint) updateSocEstimate(estimator *soc.Estimator) {
-	vehicleName := lp.socEstimateVehicle
+// estimator's own energy counters already carry the full history since the
+// anchor — this function just reads them back out.
+func (lp *Loadpoint) updateSocEstimate(estimator *soc.Estimator, vehicleName string, v api.Vehicle) {
 	if estimator == nil || vehicleName == "" {
 		return
 	}
@@ -178,13 +246,29 @@ func (lp *Loadpoint) updateSocEstimate(estimator *soc.Estimator) {
 		return
 	}
 
+	var capacity float64
+	if v != nil {
+		capacity = v.Capacity()
+	}
+
 	se, _ := loadSocEstimate(vehicleName)
 
 	// the estimator rebases prevSoc whenever the source reports a changed
 	// value; that is the moment the blind phase ends and learning is possible
 	learnedThisCall := false
 	if se.AnchorSoc != st.PrevSoc {
-		se, learnedThisCall = se.learn(st.PrevSoc, lp.socEstimateOdometer, lp.vehicleCapacity())
+		// read the odometer here rather than relying on the value cached at
+		// connect: this is the moment the car has left and regained coverage,
+		// and it is also the moment the *next* cycle's reference point has to
+		// be recorded - so the read happens on every re-anchor, not only when
+		// this one could learn.
+		odometer, odometerKnown := vehicleOdometerNow(v)
+		if !odometerKnown && se.learnable(st.PrevSoc) {
+			lp.log.WARN.Printf("soc estimate: no odometer reading, not learning the gradient from a %.1f point rise", st.PrevSoc-se.AnchorSoc)
+		}
+
+		se, learnedThisCall = se.learn(st.PrevSoc, odometer, odometerKnown, capacity)
+		se.AnchorUpdated = lp.clock.Now()
 
 		if learnedThisCall {
 			lp.log.INFO.Printf("soc gradient learned: %.1f Wh/%% (%d samples)", se.EnergyPerSocStep, se.Samples)
@@ -206,14 +290,18 @@ func (lp *Loadpoint) updateSocEstimate(estimator *soc.Estimator) {
 		}
 	}
 
-	// energy the estimator currently attributes to this anchor
-	se.EnergySinceAnchor = (st.VehicleSoc - st.PrevSoc) * st.EnergyPerSocStep
+	// energy the estimator currently attributes to this anchor. Taken from the
+	// energy counters, not from (VehicleSoc-PrevSoc)*EnergyPerSocStep: once the
+	// estimate saturates at the 100% clamp in soc.Estimator.Soc, the soc
+	// difference stops growing and every further kWh would be dropped from the
+	// record - and with it from the next learn's input.
+	se.EnergySinceAnchor = st.ChargedEnergy - st.PrevChargedEnergy
 
-	// outside a learning call this call, mirror the live estimator's own
-	// gradient (e.g. its upstream in-session learner, see soc.Estimator.Soc).
-	// A gradient learned above this call must survive this line — st was
-	// captured before the Restore() push above and still holds the pre-learn
-	// value; on later calls st and se already agree, so this line is a no-op.
+	// when this call did not learn, mirror the live estimator's own gradient
+	// (e.g. its upstream in-session learner, see soc.Estimator.Soc). A gradient
+	// learned above must survive this line — st was captured before the
+	// Restore() push above and still holds the pre-learn value; on later calls
+	// st and se already agree, so this line is a no-op.
 	if !learnedThisCall {
 		se.EnergyPerSocStep = st.EnergyPerSocStep
 	}
@@ -260,14 +348,13 @@ func (lp *Loadpoint) restoreSocEstimate() {
 	lp.socEstimator.Restore(se.AnchorSoc, se.EnergySinceAnchor, se.EnergyPerSocStep, lp.GetChargedEnergy(), se.Samples > 0)
 
 	lp.log.INFO.Printf("soc estimate restored: %.1f%% (anchor %.1f%%, %.0f Wh since)", se.soc(), se.AnchorSoc, se.EnergySinceAnchor)
-}
 
-// vehicleCapacity returns the active vehicle's nominal capacity in kWh
-func (lp *Loadpoint) vehicleCapacity() float64 {
-	if v := lp.GetVehicle(); v != nil {
-		return v.Capacity()
+	// not a reason to discard anything - a car parked without network keeps its
+	// anchor for days by design - but worth saying out loud, because the older
+	// the anchor the more of the estimate rests on the gradient alone
+	if age := lp.clock.Now().Sub(se.AnchorUpdated); age > socEstimateMaxAge && !se.AnchorUpdated.IsZero() {
+		lp.log.WARN.Printf("soc estimate: anchor is %.0fh old, the vehicle has not reported a soc since", age.Hours())
 	}
-	return 0
 }
 
 // ErrNoSocEstimator is returned when the loadpoint has no active estimator
@@ -287,26 +374,48 @@ func (lp *Loadpoint) GetSocEstimate() (soc.State, SocEstimate, bool) {
 	return lp.socEstimator.State(), se, true
 }
 
-// SetSocEstimate overrides the estimated soc. It runs inside the loadpoint
-// task queue so the estimator is never touched from the HTTP goroutine.
+// socEstimateTarget snapshots the estimator together with everything
+// updateSocEstimate needs to attribute its result to the right car, and
+// validates target against the estimator's current state.
 //
-// estimator is snapshotted here, on the caller's goroutine, and the closure
-// below closes over that local instead of re-reading lp.socEstimator at task
-// execution time. Between enqueueing and draining, setActiveVehicle can set
-// lp.socEstimator to nil or a different instance (reachable from the HTTP and
-// MQTT vehicle-select paths, not only through the task queue) - re-reading
-// the field inside the closure would risk a nil dereference in processTasks,
-// which has no recover() and would crash the whole process. Same reasoning
-// as ClearSocEstimate snapshotting the vehicle name, and as the race-guard
-// comment on updateSocEstimate referencing evcc issue 16180.
-func (lp *Loadpoint) SetSocEstimate(v float64) error {
+// The snapshot is taken on the caller's goroutine and the queued closure
+// closes over it instead of re-reading lp at task execution time. Between
+// enqueueing and draining, setActiveVehicle can set lp.socEstimator to nil or
+// to a different instance (reachable from the HTTP and MQTT vehicle-select
+// paths, not only through the task queue) - re-reading the field inside the
+// closure would risk a nil dereference in processTasks, which has no
+// recover() and would crash the whole process.
+//
+// Validation happens here rather than in the task because the task runs after
+// the HTTP response has been sent: an error raised in there would be a log
+// line under a 200.
+func (lp *Loadpoint) socEstimateTarget(target float64) (*soc.Estimator, string, api.Vehicle, error) {
 	estimator := lp.socEstimator
 	if estimator == nil {
-		return ErrNoSocEstimator
+		return nil, "", nil, ErrNoSocEstimator
 	}
 
-	if v < 0 || v > 100 {
-		return fmt.Errorf("soc out of range: %.1f", v)
+	vehicleName := lp.socEstimateVehicle
+	v := lp.GetVehicle()
+
+	if target < 0 || target > 100 {
+		return nil, "", nil, fmt.Errorf("soc out of range: %.1f", target)
+	}
+
+	if st := estimator.State(); target < st.FetchedSoc {
+		return nil, "", nil, fmt.Errorf("soc estimate cannot be set below the value reported by the vehicle (%.1f%%): %.1f", st.FetchedSoc, target)
+	}
+
+	return estimator, vehicleName, v, nil
+}
+
+// SetSocEstimate overrides the estimated soc. The actual write runs inside the
+// loadpoint task queue so the estimator is never touched from the HTTP
+// goroutine; see socEstimateTarget for the snapshot and validation rules.
+func (lp *Loadpoint) SetSocEstimate(v float64) error {
+	estimator, vehicleName, vehicle, err := lp.socEstimateTarget(v)
+	if err != nil {
+		return err
 	}
 
 	lp.enqueueTask(func() {
@@ -322,7 +431,7 @@ func (lp *Loadpoint) SetSocEstimate(v float64) error {
 			return
 		}
 
-		lp.updateSocEstimate(estimator)
+		lp.updateSocEstimate(estimator, vehicleName, vehicle)
 		lp.log.INFO.Printf("soc estimate set to %.1f%%", v)
 	})
 	lp.requestUpdate()
@@ -330,13 +439,26 @@ func (lp *Loadpoint) SetSocEstimate(v float64) error {
 	return nil
 }
 
-// ShiftSocEstimate moves the energy anchor by kwh. See the SetSocEstimate
-// doc comment for why estimator is snapshotted before enqueueing rather than
-// re-read from lp.socEstimator inside the closure.
+// ShiftSocEstimate moves the energy anchor by kwh. See the socEstimateTarget
+// doc comment for why the estimator is snapshotted before enqueueing rather
+// than re-read from lp.socEstimator inside the closure.
 func (lp *Loadpoint) ShiftSocEstimate(kwh float64) error {
 	estimator := lp.socEstimator
 	if estimator == nil {
 		return ErrNoSocEstimator
+	}
+
+	st := estimator.State()
+	if st.EnergyPerSocStep <= 0 {
+		return errors.New("no gradient available")
+	}
+
+	// validate the resulting soc, not the shift: a negative shift below the
+	// source value is the operator's obvious move after over-booking energy,
+	// and would otherwise answer 200 and revert on the next poll
+	estimator, vehicleName, vehicle, err := lp.socEstimateTarget(st.VehicleSoc + kwh*1e3/st.EnergyPerSocStep)
+	if err != nil {
+		return err
 	}
 
 	lp.enqueueTask(func() {
@@ -349,7 +471,7 @@ func (lp *Loadpoint) ShiftSocEstimate(kwh float64) error {
 			return
 		}
 
-		lp.updateSocEstimate(estimator)
+		lp.updateSocEstimate(estimator, vehicleName, vehicle)
 		lp.log.INFO.Printf("soc estimate shifted by %.2f kWh", kwh)
 	})
 	lp.requestUpdate()
@@ -357,18 +479,34 @@ func (lp *Loadpoint) ShiftSocEstimate(kwh float64) error {
 	return nil
 }
 
-// ClearSocEstimate drops the persisted record and follows the source again
+// ClearSocEstimate drops the override and the persisted record, so the
+// estimate follows the vehicle's own value again.
+//
+// Deleting the record alone is a no-op the operator cannot see: the offset
+// lives in the running estimator's prevChargedEnergy, and the very next poll
+// re-anchors and writes an identical record back. The estimator therefore has
+// to be reset first, in the same task, so no poll can slip in between.
 func (lp *Loadpoint) ClearSocEstimate() error {
-	if lp.socEstimateVehicle == "" {
+	name := lp.socEstimateVehicle
+	if name == "" {
 		return ErrNoSocEstimator
 	}
 
-	name := lp.socEstimateVehicle
+	estimator := lp.socEstimator
 
 	lp.enqueueTask(func() {
+		if estimator != nil {
+			if err := estimator.ResetOverride(); err != nil {
+				lp.log.ERROR.Printf("soc estimate: %v", err)
+			}
+		}
+
 		if err := deleteSocEstimate(name); err != nil {
 			lp.log.ERROR.Printf("soc estimate: %v", err)
+			return
 		}
+
+		lp.log.INFO.Printf("soc estimate cleared, following the vehicle again")
 	})
 	lp.requestUpdate()
 

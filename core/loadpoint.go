@@ -151,8 +151,7 @@ type Loadpoint struct {
 	coordinator    coordinator.API
 	socEstimator   *soc.Estimator
 
-	socEstimateVehicle  string  // name of the vehicle the estimate record belongs to
-	socEstimateOdometer float64 // last odometer reading, in km
+	socEstimateVehicle string // name of the vehicle the estimate record belongs to
 
 	// charge planning
 	planner          *planner.Planner
@@ -1903,6 +1902,11 @@ func (lp *Loadpoint) publishSocAndRange() {
 	// https://github.com/evcc-io/evcc/issues/16180
 	socEstimator := lp.socEstimator
 
+	// same guard, same reason: the estimate is booked onto the vehicle these
+	// two describe, so they have to be read together with the estimator above
+	socEstimateVehicle := lp.socEstimateVehicle
+	socEstimateCar := lp.GetVehicle()
+
 	socAndLimit := func(typ string, dev any) (*float64, *int64, error) {
 		var socR *float64
 		var limitR *int64
@@ -1966,7 +1970,7 @@ func (lp *Loadpoint) publishSocAndRange() {
 		} else {
 			lp.vehicleSoc = socEstimator.Soc(socR, lp.GetChargedEnergy())
 			lp.log.DEBUG.Printf("vehicle soc (estimator): %.0f%%", lp.vehicleSoc)
-			lp.updateSocEstimate(socEstimator)
+			lp.updateSocEstimate(socEstimator, socEstimateVehicle, socEstimateCar)
 		}
 	}
 	lp.publish(keys.VehicleSoc, lp.vehicleSoc)
