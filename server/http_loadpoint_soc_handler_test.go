@@ -124,9 +124,7 @@ func TestVehicleSocEstimateHandlerNotFound(t *testing.T) {
 	w := httptest.NewRecorder()
 	req := mux.SetURLVars(httptest.NewRequest(http.MethodGet, "/", nil), map[string]string{"name": "does-not-exist"})
 
-	// the site argument is unused by this handler - it reads straight from
-	// the persisted record via core.LoadSocEstimate - so nil is safe here
-	vehicleSocEstimateHandler(nil)(w, req)
+	vehicleSocEstimateHandler()(w, req)
 
 	assert.Equal(t, http.StatusNotFound, w.Code)
 }
@@ -147,7 +145,7 @@ func TestVehicleSocEstimateHandlerReturnsRecord(t *testing.T) {
 	w := httptest.NewRecorder()
 	req := mux.SetURLVars(httptest.NewRequest(http.MethodGet, "/", nil), map[string]string{"name": "test:http-vehicle"})
 
-	vehicleSocEstimateHandler(nil)(w, req)
+	vehicleSocEstimateHandler()(w, req)
 
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.Contains(t, w.Body.String(), `"soc":20`)
@@ -174,6 +172,22 @@ func TestSocEstimateSetHandlerOutOfRange(t *testing.T) {
 	socEstimateSetHandler(lp)(w, req)
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+// TestSocEstimateSetHandlerBelowSource covers the rejection added in
+// soc.Estimator.SetSoc: a target below the vehicle's own value would revert
+// within one poll, so it has to come back as a 400 naming the floor rather
+// than a 200 that quietly does nothing.
+func TestSocEstimateSetHandlerBelowSource(t *testing.T) {
+	lp := newSocEstimateTestLoadpoint(t, true)
+	lp.setErr = errors.New("soc estimate cannot be set below the value reported by the vehicle (40.0%): 30.0")
+
+	w := httptest.NewRecorder()
+	req := withValue(httptest.NewRequest(http.MethodPost, "/soc/30", nil), "30")
+	socEstimateSetHandler(lp)(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), "reported by the vehicle", "the operator has to learn what the floor is")
 }
 
 func TestSocEstimateSetHandlerNoEstimator(t *testing.T) {

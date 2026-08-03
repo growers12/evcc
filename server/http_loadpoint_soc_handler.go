@@ -8,7 +8,6 @@ import (
 
 	"github.com/evcc-io/evcc/core"
 	"github.com/evcc-io/evcc/core/loadpoint"
-	"github.com/evcc-io/evcc/core/site"
 	"github.com/evcc-io/evcc/core/soc"
 	"github.com/gorilla/mux"
 )
@@ -30,6 +29,10 @@ type socEstimateResponse struct {
 	Persisted core.SocEstimate `json:"persisted"`
 	Offset    float64          `json:"offset"`
 	AgeHours  float64          `json:"ageHours"`
+	// AnchorAgeHours is how long ago the vehicle last reported a soc, i.e. how
+	// much of Soc is measurement and how much is extrapolated from energy.
+	// AgeHours only says when the record was last written, which is a poll ago.
+	AnchorAgeHours float64 `json:"anchorAgeHours"`
 }
 
 // socEstimateHandler returns the full estimator state
@@ -55,6 +58,9 @@ func socEstimateHandler(lp loadpoint.API) http.HandlerFunc {
 		}
 		if !se.Updated.IsZero() {
 			res.AgeHours = time.Since(se.Updated).Hours()
+		}
+		if !se.AnchorUpdated.IsZero() {
+			res.AnchorAgeHours = time.Since(se.AnchorUpdated).Hours()
 		}
 
 		jsonWrite(w, res)
@@ -125,8 +131,10 @@ func socEstimateClearHandler(lp loadpoint.API) http.HandlerFunc {
 }
 
 // vehicleSocEstimateHandler returns a vehicle's persisted estimate, also for
-// vehicles that are not currently connected
-func vehicleSocEstimateHandler(site site.API) http.HandlerFunc {
+// vehicles that are not currently connected. Unlike its neighbours in the
+// vehicle route map it takes no site.API: the record is keyed by name in the
+// settings table and needs no lookup in the site's vehicle list.
+func vehicleSocEstimateHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		name := mux.Vars(r)["name"]
 
