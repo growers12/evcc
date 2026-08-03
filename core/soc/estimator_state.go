@@ -12,6 +12,7 @@ type State struct {
 	FetchedSoc        float64 `json:"fetchedSoc"`
 	PrevSoc           float64 `json:"prevSoc"`
 	PrevChargedEnergy float64 `json:"prevChargedEnergy"`
+	ChargedEnergy     float64 `json:"chargedEnergy"`
 	InitialSoc        float64 `json:"initialSoc"`
 	InitialEnergy     float64 `json:"initialEnergy"`
 	EnergyPerSocStep  float64 `json:"energyPerSocStep"`
@@ -26,6 +27,7 @@ func (s *Estimator) State() State {
 		FetchedSoc:        s.fetchedSoc,
 		PrevSoc:           s.prevSoc,
 		PrevChargedEnergy: s.prevChargedEnergy,
+		ChargedEnergy:     s.chargedEnergy,
 		InitialSoc:        s.initialSoc,
 		InitialEnergy:     s.initialEnergy,
 		EnergyPerSocStep:  s.energyPerSocStep,
@@ -46,6 +48,13 @@ func (s *Estimator) State() State {
 // prevSoc must keep matching the source value, otherwise socDelta != 0 sends
 // the next poll into the rebase branch and drops the override immediately.
 // initialSoc/initialEnergy anchor the upstream gradient learner.
+//
+// The source value is a hard floor. Shifting the anchor below it pushes
+// prevChargedEnergy past the counter, so the next poll sees energyDelta < 0,
+// takes the rebase branch and throws the override away - accepting such a
+// target would answer success and revert within one poll. The vehicle's own
+// reading is the one thing the estimator cannot argue with; only energy
+// delivered at the charger can lift the estimate above it.
 func (s *Estimator) SetSoc(target float64) error {
 	if target < 0 || target > 100 {
 		return fmt.Errorf("soc out of range: %.1f", target)
@@ -53,6 +62,10 @@ func (s *Estimator) SetSoc(target float64) error {
 
 	if s.energyPerSocStep <= 0 {
 		return errors.New("no gradient available")
+	}
+
+	if target < s.fetchedSoc {
+		return fmt.Errorf("soc estimate cannot be set below the value reported by the vehicle (%.1f%%): %.1f", s.fetchedSoc, target)
 	}
 
 	s.prevChargedEnergy -= (target - s.vehicleSoc) * s.energyPerSocStep
@@ -69,6 +82,21 @@ func (s *Estimator) ShiftEnergy(wh float64) error {
 	}
 
 	return s.SetSoc(s.vehicleSoc + wh/s.energyPerSocStep)
+}
+
+// ResetOverride drops the offset the estimate carries above the source value,
+// so the estimate follows the vehicle again.
+//
+// Deleting the persisted record alone does not do this: the offset lives in
+// the running estimator's prevChargedEnergy, and the next poll would simply
+// write the unchanged estimate back into a fresh record. Re-anchoring on
+// fetchedSoc is the exact inverse of SetSoc and needs no knowledge of the
+// current counter - it moves prevChargedEnergy to the counter value of the
+// last poll, so energy delivered from here on still lifts the estimate as it
+// should. On an estimator that was restored but never polled, fetchedSoc is
+// the restored anchor (see Restore), not zero.
+func (s *Estimator) ResetOverride() error {
+	return s.SetSoc(s.fetchedSoc)
 }
 
 // Restore seeds a fresh estimator from a persisted record.
@@ -96,7 +124,8 @@ func (s *Estimator) Restore(anchorSoc, energySinceAnchor, energyPerSocStep, char
 
 	s.prevSoc = anchorSoc
 	s.fetchedSoc = anchorSoc
-	s.prevChargedEnergy = chargedEnergy - energySinceAnchor
+	s.chargedEnergy = max(chargedEnergy, 0)
+	s.prevChargedEnergy = s.chargedEnergy - energySinceAnchor
 
 	if s.energyPerSocStep > 0 {
 		s.vehicleSoc = min(anchorSoc+energySinceAnchor/s.energyPerSocStep, 100)

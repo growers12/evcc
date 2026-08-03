@@ -34,6 +34,7 @@ func TestStateReportsInternals(t *testing.T) {
 	assert.Equal(t, 20.0, st.FetchedSoc)
 	assert.Equal(t, 20.0, st.PrevSoc)
 	assert.Equal(t, 0.0, st.PrevChargedEnergy)
+	assert.Equal(t, 500.0, st.ChargedEnergy, "the counter the estimate was computed against")
 	assert.Equal(t, 100.0, st.EnergyPerSocStep)
 	assert.Equal(t, 10000.0, st.VirtualCapacity)
 	assert.False(t, st.Learned, "gradient never updated")
@@ -91,6 +92,39 @@ func TestSetSocRejectsOutOfRange(t *testing.T) {
 	assert.Error(t, ce.SetSoc(101))
 }
 
+// TestSetSocRejectsBelowSource covers the silent-revert case: an anchor below
+// the source value pushes prevChargedEnergy past the counter, so the next poll
+// sees energyDelta < 0, rebases and drops the override. Answering success and
+// reverting one poll later is worse than refusing, so SetSoc refuses.
+func TestSetSocRejectsBelowSource(t *testing.T) {
+	ce := newTestEstimator(t)
+
+	source := 40.0
+	ce.Soc(&source, 0)
+
+	require.Error(t, ce.SetSoc(30), "below the vehicle's own value")
+	assert.Equal(t, 40.0, ce.State().VehicleSoc, "the rejected target must not be applied")
+	assert.Equal(t, 40.0, ce.Soc(&source, 0))
+
+	require.NoError(t, ce.SetSoc(40), "exactly the source value is allowed")
+}
+
+// TestShiftEnergyRejectsBelowSource is the operator's obvious move after
+// over-booking energy - it must fail loudly rather than revert on the next poll
+func TestShiftEnergyRejectsBelowSource(t *testing.T) {
+	ce := newTestEstimator(t)
+
+	source := 40.0
+	ce.Soc(&source, 0)
+	require.NoError(t, ce.ShiftEnergy(500)) // 45%
+
+	require.NoError(t, ce.ShiftEnergy(-300), "back down to 42%, still above the source")
+	assert.InDelta(t, 42.0, ce.State().VehicleSoc, 0.001)
+
+	require.Error(t, ce.ShiftEnergy(-500), "would land below the source value")
+	assert.InDelta(t, 42.0, ce.State().VehicleSoc, 0.001)
+}
+
 func TestShiftEnergy(t *testing.T) {
 	ce := newTestEstimator(t)
 
@@ -100,6 +134,39 @@ func TestShiftEnergy(t *testing.T) {
 	require.NoError(t, ce.ShiftEnergy(500)) // 500 Wh at 100 Wh/% = 5 points
 	assert.Equal(t, 20.0, ce.State().VehicleSoc)
 	assert.Equal(t, 20.0, ce.Soc(&source, 0))
+}
+
+// TestResetOverrideFollowsSourceAgain covers what DELETE /soc has to do to the
+// running estimator. Dropping the persisted record alone leaves the offset in
+// prevChargedEnergy, and the next poll writes it straight back.
+func TestResetOverrideFollowsSourceAgain(t *testing.T) {
+	ce := newTestEstimator(t)
+
+	source := 15.0
+	ce.Soc(&source, 0)   // rebase, anchors at 15
+	ce.Soc(&source, 500) // 20% - 15 from the source, 5 from 500 Wh
+	require.Equal(t, 20.0, ce.State().VehicleSoc)
+
+	require.NoError(t, ce.SetSoc(30))
+	assert.Equal(t, 30.0, ce.State().VehicleSoc)
+
+	require.NoError(t, ce.ResetOverride())
+	assert.Equal(t, 15.0, ce.State().VehicleSoc, "the estimate follows the source again")
+	assert.Equal(t, 15.0, ce.Soc(&source, 500), "and keeps doing so on the next poll")
+
+	// energy delivered after the reset still counts, the estimator is not off
+	assert.InDelta(t, 17.0, ce.Soc(&source, 700), 0.001)
+}
+
+// TestResetOverrideOnRestoredEstimator guards the case where DELETE arrives
+// before the first poll: fetchedSoc is then the restored anchor rather than
+// zero, so the reset must not drag the estimate down to 0%.
+func TestResetOverrideOnRestoredEstimator(t *testing.T) {
+	ce := newTestEstimator(t)
+	ce.Restore(15, 500, 100, 0, true)
+
+	require.NoError(t, ce.ResetOverride())
+	assert.Equal(t, 15.0, ce.State().VehicleSoc)
 }
 
 func TestRestoreSeedsEstimate(t *testing.T) {
