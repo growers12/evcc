@@ -88,7 +88,7 @@ func TestUpdateSocEstimateTracksAnchor(t *testing.T) {
 
 	source := 15.0
 	lp.socEstimator.Soc(&source, 0)
-	lp.updateSocEstimate()
+	lp.updateSocEstimate(lp.socEstimator)
 
 	se, ok := loadSocEstimate("test:2")
 	require.True(t, ok)
@@ -97,7 +97,7 @@ func TestUpdateSocEstimateTracksAnchor(t *testing.T) {
 
 	// 300 Wh into the session, source still frozen
 	lp.socEstimator.Soc(&source, 300)
-	lp.updateSocEstimate()
+	lp.updateSocEstimate(lp.socEstimator)
 
 	se, _ = loadSocEstimate("test:2")
 	assert.Equal(t, 15.0, se.AnchorSoc, "anchor stays put while the source is frozen")
@@ -117,14 +117,14 @@ func TestUpdateSocEstimateAccumulatesAcrossSessions(t *testing.T) {
 	source := 15.0
 	lp.socEstimator.Soc(&source, 0)
 	lp.socEstimator.Soc(&source, 300)
-	lp.updateSocEstimate()
+	lp.updateSocEstimate(lp.socEstimator)
 
 	// unplug and replug: fresh estimator, session counter back to zero
 	lp.socEstimator = soc.NewEstimator(lp.log, api.NewMockCharger(ctrl), vehicle)
 	lp.restoreSocEstimate()
 	lp.socEstimator.Soc(&source, 0)
 	lp.socEstimator.Soc(&source, 200)
-	lp.updateSocEstimate()
+	lp.updateSocEstimate(lp.socEstimator)
 
 	se, _ := loadSocEstimate("test:3")
 	assert.Equal(t, 500.0, se.EnergySinceAnchor, "energy accumulates across the session boundary")
@@ -151,4 +151,24 @@ func TestRestoreDropsOffsetWhenSourceMovedOn(t *testing.T) {
 	// does, because Restore anchored prevSoc at 15.
 	fresh := 42.0
 	assert.Equal(t, 42.0, lp.socEstimator.Soc(&fresh, 0), "stale offset must not survive a moved source")
+}
+
+func TestRestoreSocEstimateDropsExpiredOffset(t *testing.T) {
+	lp := NewLoadpoint(util.NewLogger("test"), coresettings.NewDatabaseSettingsAdapter("test."))
+
+	ctrl := gomock.NewController(t)
+	vehicle := api.NewMockVehicle(ctrl)
+	vehicle.EXPECT().Capacity().Return(8.5).AnyTimes()
+	lp.socEstimateVehicle = "test:5"
+
+	require.NoError(t, saveSocEstimate("test:5", SocEstimate{
+		AnchorSoc: 15, EnergySinceAnchor: 500, EnergyPerSocStep: 100, Updated: time.Now().Add(-25 * time.Hour),
+	}))
+
+	lp.socEstimator = soc.NewEstimator(lp.log, api.NewMockCharger(ctrl), vehicle)
+	lp.restoreSocEstimate()
+
+	st := lp.socEstimator.State()
+	assert.Equal(t, 15.0, st.VehicleSoc, "offset discarded: vehicle soc falls back to the anchor")
+	assert.Equal(t, 100.0, st.EnergyPerSocStep, "gradient survives even when the offset is discarded")
 }

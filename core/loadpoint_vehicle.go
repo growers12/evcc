@@ -146,14 +146,19 @@ func (lp *Loadpoint) setActiveVehicle(v api.Vehicle) {
 	if v != nil {
 		lp.socUpdated = time.Time{}
 
+		vehicleName := vehicle.Settings(lp.log, v).Name()
+
 		// resolve optional config
 		if v.Capacity() > 0 && (lp.Soc.Estimate == nil || *lp.Soc.Estimate) {
 			lp.socEstimator = soc.NewEstimator(lp.log, lp.charger, v)
-			lp.socEstimateVehicle = vehicle.Settings(lp.log, v).Name()
+			lp.socEstimateVehicle = vehicleName
+			if prev != v {
+				lp.socEstimateOdometer = 0
+			}
 			lp.restoreSocEstimate()
 		}
 
-		lp.publish(keys.VehicleName, vehicle.Settings(lp.log, v).Name())
+		lp.publish(keys.VehicleName, vehicleName)
 		lp.publish(keys.VehicleTitle, v.GetTitle())
 
 		// vehicle mode overrides the yaml onIdentify action
@@ -171,6 +176,7 @@ func (lp *Loadpoint) setActiveVehicle(v api.Vehicle) {
 	} else {
 		lp.socEstimator = nil
 		lp.socEstimateVehicle = ""
+		lp.socEstimateOdometer = 0
 		lp.unpublishVehicleIdentity()
 	}
 

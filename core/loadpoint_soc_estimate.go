@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/evcc-io/evcc/core/soc"
 	"github.com/evcc-io/evcc/server/db/settings"
 )
 
@@ -94,21 +95,29 @@ func deleteSocEstimate(name string) error {
 
 // updateSocEstimate mirrors the running estimator into the persisted record.
 //
-// The estimator's own prevChargedEnergy is relative to the session counter and
-// therefore useless across an unplug. energySinceAnchor is accumulated here
-// instead: the session's contribution is folded into a persisted base, so the
-// figure survives unplugging, session splits and restarts.
-func (lp *Loadpoint) updateSocEstimate() {
-	if lp.socEstimator == nil || lp.socEstimateVehicle == "" {
+// estimator is the caller's already-snapshotted copy of lp.socEstimator (see
+// the race-condition guard in publishSocAndRange, evcc issue 16180) — reading
+// lp.socEstimator or lp.socEstimateVehicle again here could tear an
+// (estimator, vehicle name) pair apart if setActiveVehicle runs concurrently.
+//
+// There is no separate cross-session bookkeeping here: the estimator is
+// rebuilt from scratch on every vehicle connect (setActiveVehicle), and
+// restoreSocEstimate's call to Restore() folds the persisted energySinceAnchor
+// back into the fresh estimator's prevChargedEnergy. That means the running
+// estimator's own (VehicleSoc-PrevSoc)*EnergyPerSocStep already carries the
+// full history since the anchor — this function just reads it back out.
+func (lp *Loadpoint) updateSocEstimate(estimator *soc.Estimator) {
+	vehicleName := lp.socEstimateVehicle
+	if estimator == nil || vehicleName == "" {
 		return
 	}
 
-	st := lp.socEstimator.State()
+	st := estimator.State()
 	if st.EnergyPerSocStep <= 0 {
 		return
 	}
 
-	se, _ := loadSocEstimate(lp.socEstimateVehicle)
+	se, _ := loadSocEstimate(vehicleName)
 
 	// the estimator rebases prevSoc whenever the source reports a changed
 	// value; that is the moment the blind phase ends
@@ -116,15 +125,14 @@ func (lp *Loadpoint) updateSocEstimate() {
 		se.AnchorSoc = st.PrevSoc
 		se.EnergySinceAnchor = 0
 		se.OdometerAtAnchor = lp.socEstimateOdometer
-		lp.socEstimateBase = 0
 	}
 
 	// energy the estimator currently attributes to this anchor
-	se.EnergySinceAnchor = lp.socEstimateBase + (st.VehicleSoc-st.PrevSoc)*st.EnergyPerSocStep
+	se.EnergySinceAnchor = (st.VehicleSoc - st.PrevSoc) * st.EnergyPerSocStep
 	se.EnergyPerSocStep = st.EnergyPerSocStep
 	se.Updated = lp.clock.Now()
 
-	if err := saveSocEstimate(lp.socEstimateVehicle, se); err != nil {
+	if err := saveSocEstimate(vehicleName, se); err != nil {
 		lp.log.ERROR.Printf("soc estimate: %v", err)
 	}
 }
@@ -148,19 +156,10 @@ func (lp *Loadpoint) restoreSocEstimate() {
 	if !se.plausible(lp.clock.Now()) {
 		lp.log.DEBUG.Printf("soc estimate: offset discarded, keeping gradient %.1f Wh/%%", se.EnergyPerSocStep)
 		lp.socEstimator.Restore(se.AnchorSoc, 0, se.EnergyPerSocStep, lp.GetChargedEnergy(), se.Samples > 0)
-		lp.socEstimateBase = 0
 		return
 	}
 
 	lp.socEstimator.Restore(se.AnchorSoc, se.EnergySinceAnchor, se.EnergyPerSocStep, lp.GetChargedEnergy(), se.Samples > 0)
-
-	// Restore already folds energySinceAnchor into the estimator's own
-	// prevChargedEnergy (see its doc comment), so the freshly restored
-	// estimator's (VehicleSoc-PrevSoc)*EnergyPerSocStep already equals the
-	// full total since the anchor. socEstimateBase must therefore start at
-	// zero here — adding se.EnergySinceAnchor again in updateSocEstimate
-	// would double-count everything the estimator already carries forward.
-	lp.socEstimateBase = 0
 
 	lp.log.INFO.Printf("soc estimate restored: %.1f%% (anchor %.1f%%, %.0f Wh since)", se.soc(), se.AnchorSoc, se.EnergySinceAnchor)
 }
