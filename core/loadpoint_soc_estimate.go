@@ -34,11 +34,6 @@ const (
 	// socLearnMinRise is the smallest soc rise worth learning from, in points
 	socLearnMinRise = 10.0
 
-	// socLearnMaxDistance caps the driving between unplug and the first fresh
-	// reading, in km. The car only regains network after leaving the garage,
-	// so some driving is unavoidable — but not an arbitrary amount.
-	socLearnMaxDistance = 20.0
-
 	// socLearnSmoothing weights a new measurement against the running value
 	socLearnSmoothing = 0.3
 )
@@ -54,7 +49,6 @@ type SocEstimate struct {
 	EnergySinceAnchor float64   `json:"energySinceAnchor"` // energy delivered at the charger since, in Wh
 	EnergyPerSocStep  float64   `json:"energyPerSocStep"`  // Wh per soc percentage point
 	Samples           int       `json:"samples"`           // number of completed learning cycles
-	OdometerAtAnchor  float64   `json:"odometerAtAnchor"`  // km reading when the anchor was set
 	AnchorUpdated     time.Time `json:"anchorUpdated"`     // when the vehicle last reported a changed soc
 	Updated           time.Time `json:"updated"`           // when this record was last written
 }
@@ -100,10 +94,7 @@ func (se SocEstimate) plausible(now time.Time) bool {
 }
 
 // learnable reports whether a re-anchor onto newSoc could produce a usable
-// gradient measurement at all. Used as a pre-filter so that the odometer is
-// only read when it can actually decide something - the source changing by a
-// point or two is a re-anchor like any other and happens far more often than
-// a real learning moment.
+// gradient measurement at all.
 func (se SocEstimate) learnable(newSoc float64) bool {
 	return newSoc-se.AnchorSoc > socLearnMinRise && se.EnergySinceAnchor > 0
 }
@@ -111,34 +102,37 @@ func (se SocEstimate) learnable(newSoc float64) bool {
 // learn folds a fresh vehicle reading into the gradient and re-anchors the
 // record. The bool reports whether the gradient was actually updated.
 //
-// odometerKnown false means the current reading could not be established, not
-// that the car has no odometer (a car without one reports 0 with
-// odometerKnown true, which disables the distance guard as before). Without a
-// current reading the drive since the anchor cannot be bounded, so the
-// gradient is left alone: an unnoticed 60 km drive inflates the measurement by
-// about half, lands inside the sanity band and would be accepted.
+// There is deliberately no odometer guard. It was tried and removed: this
+// vehicle only writes its odometer at ignition-off, which happens in the
+// garage without reception, so the value that arrives together with the fresh
+// soc describes the drive *before* the anchor - energy that was consumed
+// before the anchor soc was measured and cannot corrupt this measurement. The
+// guard therefore rejected every real learning opportunity while protecting
+// against nothing. The case it was meant to catch - a long drive between
+// unplug and the fresh reading - is small in practice, because the car reports
+// within a few hundred metres of leaving the garage.
+//
+// What remains as protection: a rise of more than socLearnMinRise excludes
+// noise, the sanity band excludes meter glitches and vehicle mix-ups, and the
+// EMA lets a single bad sample move the gradient by at most 30% of its error.
 //
 // The anchor is re-set even when learning is rejected. Otherwise a single
-// missed learning moment — a long drive before the car reports — would leave
-// EnergySinceAnchor growing against a stale anchor forever. OdometerAtAnchor
-// on the other hand is only advanced on a fresh reading: keeping the older one
-// makes the next distance check span more kilometres than it should, which can
-// only reject a learn, never wave a bad one through.
-func (se SocEstimate) learn(newSoc float64, odometer float64, odometerKnown bool, capacity float64) (SocEstimate, bool) {
+// missed learning moment would leave EnergySinceAnchor growing against a stale
+// anchor forever.
+func (se SocEstimate) learn(newSoc float64, capacity float64) (SocEstimate, bool) {
 	rise := newSoc - se.AnchorSoc
-	distance := odometer - se.OdometerAtAnchor
 	nominal := capacity * 1e3 / soc.ChargeEfficiency / 100
 
 	learned := false
 
-	switch {
-	case !se.learnable(newSoc):
-	case !odometerKnown:
-	case odometer > 0 && se.OdometerAtAnchor > 0 && distance > socLearnMaxDistance:
-	default:
+	if se.learnable(newSoc) {
 		// energySinceAnchor is measured at the charger, so the learned value
 		// carries the real charging losses — which is exactly what the 85%
-		// efficiency factor stands in for until then
+		// efficiency factor stands in for until then. Both of the factors that
+		// go into that default are optimistic: it uses gross rather than
+		// usable capacity, and 85% rather than the ~90%+ a three-phase 11 kW
+		// charge actually reaches. Measured values therefore land some 15%
+		// below it, which is the correction this is here to make.
 		measured := se.EnergySinceAnchor / rise
 
 		if measured >= 0.5*nominal && measured <= 2*nominal {
@@ -151,36 +145,7 @@ func (se SocEstimate) learn(newSoc float64, odometer float64, odometerKnown bool
 	se.AnchorSoc = newSoc
 	se.EnergySinceAnchor = 0
 
-	if odometerKnown && odometer > 0 {
-		se.OdometerAtAnchor = odometer
-	}
-
 	return se, learned
-}
-
-// vehicleOdometerNow reads the vehicle's odometer at the moment it is needed.
-//
-// lp.socEstimateOdometer used to stand in for this, but it is only written at
-// vehicle connect and disconnect, while the learning moment is the poll after
-// the car has left the garage and regained coverage - so the distance measured
-// was always ~0 and the guard never fired.
-//
-// The second return value distinguishes "no reading" from "no odometer": a
-// vehicle without the capability reports (0, true), which leaves the distance
-// guard disabled exactly as before, while a failed read reports (0, false) and
-// suppresses learning.
-func vehicleOdometerNow(v api.Vehicle) (float64, bool) {
-	vs, ok := api.Cap[api.VehicleOdometer](v)
-	if !ok {
-		return 0, true
-	}
-
-	odo, err := vs.Odometer()
-	if err != nil {
-		return 0, false
-	}
-
-	return odo, true
 }
 
 func socEstimateSettingsKey(name string) string {
@@ -257,17 +222,7 @@ func (lp *Loadpoint) updateSocEstimate(estimator *soc.Estimator, vehicleName str
 	// value; that is the moment the blind phase ends and learning is possible
 	learnedThisCall := false
 	if se.AnchorSoc != st.PrevSoc {
-		// read the odometer here rather than relying on the value cached at
-		// connect: this is the moment the car has left and regained coverage,
-		// and it is also the moment the *next* cycle's reference point has to
-		// be recorded - so the read happens on every re-anchor, not only when
-		// this one could learn.
-		odometer, odometerKnown := vehicleOdometerNow(v)
-		if !odometerKnown && se.learnable(st.PrevSoc) {
-			lp.log.WARN.Printf("soc estimate: no odometer reading, not learning the gradient from a %.1f point rise", st.PrevSoc-se.AnchorSoc)
-		}
-
-		se, learnedThisCall = se.learn(st.PrevSoc, odometer, odometerKnown, capacity)
+		se, learnedThisCall = se.learn(st.PrevSoc, capacity)
 		se.AnchorUpdated = lp.clock.Now()
 
 		if learnedThisCall {
@@ -335,17 +290,26 @@ func (lp *Loadpoint) restoreSocEstimate() {
 		return
 	}
 
-	// the gradient is a property of the car and always worth keeping; the
-	// offset only if the record is still plausible. Should the source have
-	// moved on while evcc was down, the estimator's rebase branch drops the
-	// offset on the first poll — see the comment on plausible().
+	// a *learned* gradient is a property of the car and always worth keeping.
+	// An unlearned one is just the static default the record happened to copy
+	// at the time, and restoring it would pin the estimator to a capacity that
+	// may since have been corrected in the config - passing 0 leaves the fresh
+	// estimator's own default in place.
+	gradient := 0.0
+	if se.Samples > 0 {
+		gradient = se.EnergyPerSocStep
+	}
+
+	// the offset is restored only if the record is still plausible. Should the
+	// source have moved on while evcc was down, the estimator's rebase branch
+	// drops the offset on the first poll — see the comment on plausible().
 	if !se.plausible(lp.clock.Now()) {
 		lp.log.DEBUG.Printf("soc estimate: offset discarded, keeping gradient %.1f Wh/%%", se.EnergyPerSocStep)
-		lp.socEstimator.Restore(se.AnchorSoc, 0, se.EnergyPerSocStep, lp.GetChargedEnergy(), se.Samples > 0)
+		lp.socEstimator.Restore(se.AnchorSoc, 0, gradient, lp.GetChargedEnergy(), se.Samples > 0)
 		return
 	}
 
-	lp.socEstimator.Restore(se.AnchorSoc, se.EnergySinceAnchor, se.EnergyPerSocStep, lp.GetChargedEnergy(), se.Samples > 0)
+	lp.socEstimator.Restore(se.AnchorSoc, se.EnergySinceAnchor, gradient, lp.GetChargedEnergy(), se.Samples > 0)
 
 	lp.log.INFO.Printf("soc estimate restored: %.1f%% (anchor %.1f%%, %.0f Wh since)", se.soc(), se.AnchorSoc, se.EnergySinceAnchor)
 
